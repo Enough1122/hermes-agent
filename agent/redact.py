@@ -36,26 +36,6 @@ _SENSITIVE_QUERY_PARAMS = frozenset({
     "x-amz-signature",
 })
 
-# Sensitive form-urlencoded / JSON body key names (case-insensitive exact match).
-# Exact match, NOT substring — "token_count" and "session_id" must NOT match.
-# Ported from nearai/ironclaw#2529.
-_SENSITIVE_BODY_KEYS = frozenset({
-    "access_token",
-    "refresh_token",
-    "id_token",
-    "token",
-    "api_key",
-    "apikey",
-    "client_secret",
-    "password",
-    "auth",
-    "jwt",
-    "secret",
-    "private_key",
-    "authorization",
-    "key",
-})
-
 # Snapshot at import time so runtime env mutations (e.g. LLM-generated
 # `export HERMES_REDACT_SECRETS=false`) cannot disable redaction
 # mid-session.  ON by default — secure default per issue #17691. Users who
