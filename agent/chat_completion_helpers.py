@@ -2477,6 +2477,59 @@ def _build_partial_stream_stub(
     )
 
 
+def _estimate_missing_stream_usage(agent, api_kwargs, full_content, reasoning_text):
+    """Synthesize a usage object when the provider returned none in the stream.
+
+    Providers whose streaming backend ignores ``stream_options.include_usage``
+    (MiniMax via OpenRouter, and other aggregators whose upstream doesn't
+    support usage reporting in streaming mode) deliver a normal completion
+    with no usage chunk. The request still sends
+    ``stream_options={"include_usage": True}``, but it is silently ignored, so
+    the assembled response carries ``usage=None``. Downstream token accounting
+    is gated on ``if response.usage:`` — when usage is missing the ENTIRE
+    accounting block (session counters, context compressor, cost estimation,
+    session-DB persistence) is skipped and the session silently records 0/0
+    tokens despite running normally (#12023).
+
+    Returns a ``SimpleNamespace`` shaped like an OpenAI Chat Completions usage
+    object (``prompt_tokens`` / ``completion_tokens``) so ``normalize_usage``
+    and the existing accounting path execute unchanged — no duplication of the
+    accumulation/cost/DB logic. Input is estimated from the request messages,
+    output from the assembled visible text + reasoning (a major cost center
+    for reasoning models). The estimate is approximate (character-based), so a
+    warning is logged to make the degradation visible.
+
+    Best-effort: any estimation failure, or a fully-empty estimate, returns
+    ``None`` so the caller leaves usage unset and preserves prior behavior for
+    genuinely empty responses.
+    """
+    try:
+        from agent.model_metadata import (
+            estimate_messages_tokens_rough,
+            estimate_tokens_rough,
+        )
+
+        est_in = estimate_messages_tokens_rough(api_kwargs.get("messages", []) or [])
+        est_out = estimate_tokens_rough(full_content or "") + estimate_tokens_rough(
+            reasoning_text or ""
+        )
+    except Exception as exc:
+        logger.debug("streaming usage estimation failed: %s", exc)
+        return None
+    if not est_in and not est_out:
+        return None
+    logger.warning(
+        "No usage data in streaming response for model=%s provider=%s — using "
+        "estimated tokens (in≈%d, out≈%d). Cost/analytics for this call are "
+        "approximate.",
+        getattr(agent, "model", "unknown"),
+        getattr(agent, "provider", None) or "unknown",
+        est_in,
+        est_out,
+    )
+    return SimpleNamespace(prompt_tokens=est_in, completion_tokens=est_out)
+
+
 def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=None):
     """Streaming variant of _interruptible_api_call for real-time token delivery.
 
@@ -3486,11 +3539,24 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             message=mock_message,
             finish_reason=effective_finish_reason,
         )
+        # Providers whose streaming backend ignores
+        # stream_options.include_usage (MiniMax via OpenRouter, etc.) complete
+        # normally but deliver no usage chunk, leaving usage_obj=None. Without
+        # a fallback the downstream accounting (gated on `response.usage`) is
+        # skipped entirely and the session silently records 0/0 tokens (#12023).
+        # Synthesize an estimate so the existing accounting path runs unchanged.
+        # Only the normal-completion path: partial-stream-stub drops re-enter
+        # the loop for continuation, so estimating there would double-count.
+        _final_usage = usage_obj
+        if _final_usage is None:
+            _final_usage = _estimate_missing_stream_usage(
+                agent, api_kwargs, full_content, "".join(reasoning_parts) or None
+            )
         return SimpleNamespace(
             id="stream-" + str(uuid.uuid4()),
             model=model_name,
             choices=[mock_choice],
-            usage=usage_obj,
+            usage=_final_usage,
         )
 
     def _call_anthropic(request_client):
