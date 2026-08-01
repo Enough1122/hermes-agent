@@ -3084,6 +3084,15 @@ def _pause_windows_gateways_for_update() -> dict | None:
         logger.debug("Could not discover Windows gateway PIDs before update: %s", exc)
         return None
     if not running_pids:
+        # The desktop app's backend (``hermes serve``) hosts the gateway
+        # runtime itself, so it is gateway-equivalent for liveness. If it is
+        # already up the gateway role is served and we must NOT cold-start a
+        # standalone ``gateway run`` after the update: that spawns a second
+        # daemon which races the desktop backend on ports/state files and
+        # accumulates across updates. The desktop app owns gateway lifecycle in
+        # this configuration, so leave it alone. (#76129)
+        if _desktop_backend_is_serving():
+            return None
         # No gateway is running right now, but the user may have installed an
         # autostart entry (Scheduled Task or Startup-folder login item) — that
         # is an explicit "I want a gateway" signal. A gateway that died between
@@ -3204,6 +3213,29 @@ def _pause_windows_gateways_for_update() -> dict | None:
         "unmapped": unmapped,
     }
 
+def _desktop_backend_is_serving() -> bool:
+    """True when a Hermes desktop backend (``hermes serve`` / ``dashboard``) is up.
+
+    The desktop app's backend hosts the gateway runtime itself, so it is
+    gateway-equivalent for liveness. The Windows update flow consults this
+    before cold-starting a standalone gateway: when the desktop is the runtime,
+    spawning a second ``gateway run`` after every update produces duplicate
+    daemons that race the desktop backend on ports/state files and accumulate
+    across updates (#76129).
+
+    Reuses ``_find_stale_dashboard_pids`` (the same wmic/``ps`` scan and the
+    same ``serve``/``dashboard`` patterns the dashboard-kill path uses) so
+    detection cannot drift from that path. Best-effort: any scan error is
+    logged and treated as "not serving" so a flaky scan never blocks a
+    legitimate cold-start.
+    """
+    try:
+        return bool(_m()._find_stale_dashboard_pids())
+    except Exception as exc:
+        logger.debug("Could not scan for desktop serve backends: %s", exc)
+        return False
+
+
 def _cold_start_windows_gateway_after_update() -> None:
     """Start a fresh detached gateway after update when one is installed but down.
 
@@ -3230,12 +3262,19 @@ def _cold_start_windows_gateway_after_update() -> None:
 
     # Re-check liveness right before spawning — between pause and resume the
     # autostart entry may have already brought a gateway up, or a leftover
-    # process may have re-registered. Don't double-start.
+    # process may have re-registered. Don't double-start. Also recognize the
+    # desktop backend (``hermes serve``) as gateway-equivalent: if it survived
+    # the update (the desktop app protects its own backend child via
+    # HERMES_DESKTOP_CHILD_PID), spawning a standalone gateway here would
+    # duplicate the daemon. (#76129)
     try:
         if list(find_gateway_pids(all_profiles=True)):
             return
     except Exception as exc:
         logger.debug("Could not re-check gateway liveness before cold-start: %s", exc)
+        return
+
+    if _desktop_backend_is_serving():
         return
 
     try:
