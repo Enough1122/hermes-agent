@@ -437,7 +437,13 @@ def _sanitize_node(node: Any, path: str) -> Any:
         props = out.get("properties") or {}
         valid = [r for r in out["required"] if isinstance(r, str) and r in props]
         if not valid:
-            out.pop("required", None)
+            # Keep an empty ``required`` array rather than dropping the key.
+            # Several strict OpenAI-compatible backends (Azure OpenAI, custom
+            # proxies) reject a *missing* ``required`` field with HTTP 400
+            # "null is not of type 'array'" because they decode the absent key
+            # as null. An empty array is valid JSON Schema and universally
+            # accepted. (#56123)
+            out["required"] = []
         elif len(valid) != len(out["required"]):
             out["required"] = valid
 

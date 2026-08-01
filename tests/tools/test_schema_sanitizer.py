@@ -156,6 +156,24 @@ def test_required_pruned_to_existing_properties():
     assert out[0]["function"]["parameters"]["required"] == ["name"]
 
 
+def test_required_all_missing_kept_as_empty_list():
+    """#56123: when every ``required`` entry references a non-existent
+    property, the key must be kept as an empty list rather than dropped.
+    Strict OpenAI-compatible backends (Azure OpenAI, custom proxies) decode a
+    *missing* ``required`` field as null and reject the whole tools payload
+    with HTTP 400 "null is not of type 'array'". An empty array is valid JSON
+    Schema and universally accepted."""
+    tools = [_tool("browser_back", {
+        "type": "object",
+        "properties": {},
+        "required": ["gone"],
+    })]
+    out = sanitize_tool_schemas(tools)
+    params = out[0]["function"]["parameters"]
+    assert "required" in params, "required key must be preserved, not popped"
+    assert params["required"] == []
+
+
 def test_well_formed_schema_unchanged():
     schema = {
         "type": "object",
