@@ -1430,7 +1430,7 @@ class CLITuiMixin:
                     from agent.redact import redact_sensitive_text
                     with open(_hermes_home / "interrupt_debug.log", "a", encoding="utf-8") as _f:
                         _f.write(
-                            f"{time.strftime('%H:%M:%S')} ENTER: queued interrupt msg={redact_sensitive_text(str(payload))[:60]!r}, "
+                            f"{time.strftime('%H:%M:%S')} ENTER: queued interrupt msg={redact_sensitive_text(str(payload), force=True)[:60]!r}, "
                             f"agent_running={self._agent_running}\n")
                 except Exception:
                     pass

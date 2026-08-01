@@ -396,7 +396,7 @@ class CLIChatTurnMixin:
             try:
                 from agent.redact import redact_sensitive_text
                 with open(_hermes_home / "interrupt_debug.log", "a", encoding="utf-8") as _f:
-                    _f.write(f"{time.strftime('%H:%M:%S')} interrupt fired: msg={redact_sensitive_text(str(interrupt_msg))[:60]!r}, "
+                    _f.write(f"{time.strftime('%H:%M:%S')} interrupt fired: msg={redact_sensitive_text(str(interrupt_msg), force=True)[:60]!r}, "
                              f"children={len(self.agent._active_children)}, "
                              f"parent._interrupt={self.agent._interrupt_requested}\n")
                     for _ci, _ch in enumerate(self.agent._active_children):
