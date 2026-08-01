@@ -2591,11 +2591,57 @@ def _build_media_placeholder(event) -> str:
     return "\n".join(parts)
 
 
-def _build_document_context_note(display_name: str, agent_path: str, mtype: str) -> str:
+# Maximum number of bytes of a text document to inline into the user turn.
+# Larger documents are left on disk and the context note points the agent at
+# the saved path instead, so we never silently truncate a file the model then
+# answers from as if it were complete. 64 KiB is a generous excerpt that fits
+# comfortably in a single turn without blowing past typical context budgets.
+_INLINE_TEXT_MAX_BYTES = 64 * 1024
+
+
+def _read_text_document_for_inline(path: str) -> Optional[str]:
+    """Read a small text document for inline inclusion in the user turn.
+
+    Returns the decoded text (truncated to ``_INLINE_TEXT_MAX_BYTES`` with a
+    visible truncation marker) or ``None`` when the file is missing, empty,
+    or unreadable. Invalid UTF-8 bytes are replaced rather than raising.
+    Returning ``None`` lets the caller emit a path-pointing note that does
+    *not* promise "included below" — see #76022.
+    """
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return None
+    if size <= 0:
+        return None
+    try:
+        with open(path, "rb") as fh:
+            raw = fh.read(_INLINE_TEXT_MAX_BYTES + 1)
+    except OSError:
+        return None
+    truncated = len(raw) > _INLINE_TEXT_MAX_BYTES
+    if truncated:
+        raw = raw[:_INLINE_TEXT_MAX_BYTES]
+    text = raw.decode("utf-8", errors="replace")
+    if truncated:
+        text += (
+            f"\n\n[... file truncated at {_INLINE_TEXT_MAX_BYTES // 1024} KiB; "
+            f"the complete file is saved at: {path} ...]"
+        )
+    return text
+
+
+def _build_document_context_note(
+    display_name: str, agent_path: str, mtype: str, *, content_inlined: bool = False
+) -> str:
     """Context note prepended to a user turn when they attach a document.
 
-    Text documents (``text/*``) have their content inlined upstream by the
-    platform adapter, so the note just confirms that and records the path.
+    Text documents (``text/*``) get their content inlined into the turn by the
+    caller (``run.py``'s document loop) when the file is small and readable.
+    Only then does the note promise "Its content has been included below" —
+    if inlining was skipped (file too large / unreadable), the note instead
+    points the agent at the saved path so it never claims content the model
+    doesn't actually have (#76022).
 
     Binary documents (PDF, DOCX, XLSX, …) cannot be inlined as text. The note
     must tell the agent to *extract* the text itself before answering — earlier
@@ -2604,10 +2650,17 @@ def _build_document_context_note(display_name: str, agent_path: str, mtype: str)
     "unreadable" to the agent even though it has the tools to read them.
     """
     if mtype.startswith("text/"):
+        if content_inlined:
+            return (
+                f"[The user sent a text document: '{display_name}'. "
+                f"Its content has been included below. "
+                f"The file is also saved at: {agent_path}]"
+            )
         return (
-            f"[The user sent a text document: '{display_name}'. "
-            f"Its content has been included below. "
-            f"The file is also saved at: {agent_path}]"
+            f"[The user sent a text document: '{display_name}'. It is saved at: "
+            f"{agent_path}. Its content was not inlined here (the file is too large "
+            f"or could not be read). Read it yourself — for example with the terminal "
+            f"tool — before answering, instead of asking the user to paste the contents.]"
         )
     return (
         f"[The user sent a document: '{display_name}'. It is saved at: {agent_path}. "
@@ -15294,8 +15347,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # cache directories are auto-mounted at /root/.hermes/cache/* by get_cache_directory_mounts().
                 agent_path = to_agent_visible_cache_path(path)
 
-                context_note = _build_document_context_note(display_name, agent_path, mtype)
-                message_text = f"{context_note}\n\n{message_text}"
+                # Inline small text documents so the context note's
+                # "included below" promise is truthful. No platform adapter
+                # inlines this content — without inlining here the agent is
+                # told content is present when it isn't, and confidently
+                # hallucinates an answer. (#76022)
+                inlined_content: Optional[str] = None
+                if mtype.startswith("text/"):
+                    inlined_content = _read_text_document_for_inline(path)
+
+                context_note = _build_document_context_note(
+                    display_name, agent_path, mtype,
+                    content_inlined=inlined_content is not None,
+                )
+                if inlined_content:
+                    message_text = (
+                        f"{context_note}\n\n"
+                        f"<document_content path=\"{agent_path}\">\n"
+                        f"{inlined_content}\n"
+                        f"</document_content>\n\n"
+                        f"{message_text}"
+                    )
+                else:
+                    message_text = f"{context_note}\n\n{message_text}"
 
         # Discord: surface the triggering message id per-turn on the user
         # message rather than in the cached system prompt. message_id changes
