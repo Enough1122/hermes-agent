@@ -10546,6 +10546,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             recovered = process_registry.recover_from_checkpoint()
             if recovered:
                 logger.info("Recovered %s background process(es) from previous run", recovered)
+            # Start the lifetime reaper so a leaked background tool subprocess
+            # (e.g. a hung ``next build``) can't run unbounded, push the gateway
+            # cgroup past MemoryHigh, and starve the event loop (#76115). The
+            # reaper runs on its own daemon thread — not this asyncio loop — so
+            # it still fires while the loop is throttled. Idempotent.
+            from tools.process_registry import ensure_lifetime_reaper
+            ensure_lifetime_reaper()
         except Exception as e:
             logger.warning("Process checkpoint recovery: %s", e)
 

@@ -246,6 +246,17 @@ DEFAULT_CONFIG = {
         # window so it can't leak indefinitely. 0 disables escalation (SIGTERM
         # only — the historical behavior). Floored internally at 0.
         "daemon_term_grace_seconds": 2.0,
+        # Maximum lifetime (hours) for a background tool subprocess
+        # (``terminal(background=true)``). A process still running past this
+        # age is tree-killed by the lifetime reaper — a leaked ``next build``
+        # that hung, a forgotten dev server, etc. — so a single runaway
+        # subprocess can't push the gateway cgroup past MemoryHigh and starve
+        # the event loop (#76115). The reaper runs on its own daemon thread
+        # (not the asyncio loop) so it still fires while the loop is throttled.
+        # 0 disables the cap (processes live until explicitly killed). Default
+        # 24h matches the session-reset stale threshold; lower it if your
+        # workload leaks faster than that.
+        "bg_process_max_lifetime_hours": 24,
         # Environment variables to pass through to sandboxed execution
         # (terminal and execute_code).  Skill-declared required_environment_variables
         # are passed through automatically; this list is for non-skill use cases.

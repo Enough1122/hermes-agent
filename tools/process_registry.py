@@ -1948,6 +1948,106 @@ class ProcessRegistry:
                 killed += 1
         return killed
 
+    # ----- Lifetime cap (reap long-running leaked subprocesses) -----
+
+    @classmethod
+    def _bg_process_max_lifetime_seconds(cls) -> Optional[float]:
+        """Configured maximum lifetime (seconds) for a background subprocess.
+
+        Read from ``terminal.bg_process_max_lifetime_hours`` in config.yaml
+        (default 24h, see ``config_defaults.py``). Returns ``None`` when the
+        cap is disabled (``<= 0``) or unreadable, which tells the caller
+        (``reap_expired`` / the lifetime reaper thread) to do nothing.
+        Mirrors the ``_daemon_term_grace_seconds`` config-reading pattern.
+        """
+        try:
+            from hermes_cli.config import read_raw_config, cfg_get, DEFAULT_CONFIG
+            cfg = read_raw_config()
+            val = cfg_get(cfg, "terminal", "bg_process_max_lifetime_hours")
+            if val is None:
+                val = DEFAULT_CONFIG["terminal"]["bg_process_max_lifetime_hours"]
+            hours = float(val)
+        except Exception:
+            return None
+        if hours <= 0:
+            return None
+        return hours * 3600.0
+
+    def reap_expired(self, max_age_seconds: Optional[float] = None) -> int:
+        """Tree-kill running background processes older than ``max_age_seconds``.
+
+        Closes the "no max lifetime on background tool subprocesses" gap
+        (#76115): a finite command (``next build``) that hangs used to run
+        forever inside the gateway cgroup, push it past ``MemoryHigh``, and
+        starve the asyncio event loop until every platform and cron timed out.
+        This enforces a hard lifetime cap — over-age sessions are torn down
+        through the normal :meth:`kill_process` path, which SIGTERMs the whole
+        descendant tree (children before parent) and escalates to SIGKILL
+        within the daemon grace window, so orphaned grandchildren are reaped
+        too, not just the direct child.
+
+        Args:
+            max_age_seconds: Kill sessions whose wall-clock age
+                (``time.time() - started_at``) exceeds this. ``None`` reads
+                ``terminal.bg_process_max_lifetime_hours`` (default 24h);
+                a non-positive value is a no-op.
+
+        Returns:
+            The number of sessions killed (or already-exited ones swept).
+        """
+        if max_age_seconds is None:
+            max_age_seconds = self._bg_process_max_lifetime_seconds()
+        if not max_age_seconds or max_age_seconds <= 0:
+            return 0
+
+        with self._lock:
+            candidates = [s for s in self._running.values() if not s.exited]
+
+        now = time.time()
+        targets = []
+        for session in candidates:
+            # Refresh detached/remote sessions so .exited is current before we
+            # decide to kill — a recovered PID that already exited must not be
+            # signalled (and may have been recycled onto a stranger).
+            try:
+                self._refresh_detached_session(session)
+            except Exception:
+                pass
+            if session.exited:
+                continue
+            try:
+                age = now - session.started_at
+            except Exception:
+                continue
+            if age > max_age_seconds:
+                targets.append(session)
+
+        killed = 0
+        for session in targets:
+            try:
+                result = self.kill_process(
+                    session.id,
+                    source="lifetime_cap",
+                    consume_output=False,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Lifetime reaper: failed to kill over-age session %s "
+                    "(pid=%s, age=%.0fs, cap=%.0fs): %s",
+                    session.id, session.pid,
+                    now - session.started_at, max_age_seconds, exc,
+                )
+                continue
+            if result.get("status") in {"killed", "already_exited"}:
+                killed += 1
+                logger.info(
+                    "Lifetime reaper: killed over-age background process %s "
+                    "(pid=%s, command=%r, age=%.0fs, cap=%.0fs) — see #76115.",
+                    session.id, session.pid, session.command[:80],
+                    now - session.started_at, max_age_seconds,
+                )
+        return killed
+
     # ----- Cleanup / Pruning -----
 
     def _prune_if_needed(self):
@@ -2122,6 +2222,86 @@ class ProcessRegistry:
 
 # Module-level singleton
 process_registry = ProcessRegistry()
+
+
+# ---------------------------------------------------------------------------
+# Lifetime reaper — a daemon thread that bounds how long a background tool
+# subprocess may run. Runs on its OWN thread (not the gateway asyncio loop) so
+# it still fires while the loop is throttled by cgroup memory-pressure reclaim
+# — the exact condition that let a leaked ``next build`` run 11h and take the
+# whole gateway offline (#76115). Idempotent: only one reaper thread ever
+# exists; later calls just refresh the cap / interval. Per-cycle exceptions are
+# swallowed so the thread can never die and leave the cap unenforced.
+# ---------------------------------------------------------------------------
+
+# How often the reaper wakes to sweep. Short enough to catch a leak well before
+# a 24h cap is reached on a fast-leaking host, long enough to be negligible.
+_LIFETIME_REAPER_INTERVAL_SECONDS = 300.0
+
+_lifetime_reaper_thread: Optional[threading.Thread] = None
+_lifetime_reaper_lock = threading.Lock()
+# (max_age_seconds, interval_seconds) the running reaper consults each cycle.
+# ``None`` max_age means "read config each cycle" so live config edits take
+# effect without restarting the thread.
+_lifetime_reaper_max_age: Optional[float] = None
+_lifetime_reaper_interval: float = _LIFETIME_REAPER_INTERVAL_SECONDS
+
+
+def _lifetime_reaper_loop() -> None:
+    """Body of the lifetime reaper daemon thread."""
+    while True:
+        try:
+            cap = _lifetime_reaper_max_age
+            if cap is None:
+                cap = ProcessRegistry._bg_process_max_lifetime_seconds()
+            if cap and cap > 0:
+                process_registry.reap_expired(cap)
+        except Exception as exc:  # never let the reaper die
+            logger.debug("Lifetime reaper cycle failed: %s", exc)
+        try:
+            time.sleep(max(1.0, _lifetime_reaper_interval))
+        except Exception:
+            time.sleep(_LIFETIME_REAPER_INTERVAL_SECONDS)
+
+
+def ensure_lifetime_reaper(
+    max_age_seconds: Optional[float] = None,
+    interval_seconds: Optional[float] = None,
+) -> None:
+    """Start the background-subprocess lifetime reaper (idempotent).
+
+    Safe to call repeatedly (e.g. on every gateway start). The first call
+    spawns the daemon thread; subsequent calls only refresh ``max_age_seconds``
+    / ``interval_seconds`` for the next cycle, so live config edits take effect
+    without restarting the thread.
+
+    Args:
+        max_age_seconds: Kill background processes older than this. ``None``
+            (default) makes the reaper re-read
+            ``terminal.bg_process_max_lifetime_hours`` every cycle, so config
+            changes are picked up without a restart. A non-positive value
+            disables killing (the thread keeps running but ``reap_expired``
+            is a no-op).
+        interval_seconds: Sweep cadence in seconds. Defaults to
+            ``_LIFETIME_REAPER_INTERVAL_SECONDS`` (300s).
+    """
+    global _lifetime_reaper_thread, _lifetime_reaper_max_age, _lifetime_reaper_interval
+    with _lifetime_reaper_lock:
+        if interval_seconds is not None and interval_seconds > 0:
+            _lifetime_reaper_interval = float(interval_seconds)
+        _lifetime_reaper_max_age = max_age_seconds
+        if _lifetime_reaper_thread is not None and _lifetime_reaper_thread.is_alive():
+            return
+        _lifetime_reaper_thread = threading.Thread(
+            target=_lifetime_reaper_loop,
+            name="hermes-bg-process-lifetime-reaper",
+            daemon=True,
+        )
+        _lifetime_reaper_thread.start()
+        logger.debug(
+            "Started background-process lifetime reaper (interval=%ss, "
+            "max_age=%s)", _lifetime_reaper_interval, _lifetime_reaper_max_age,
+        )
 
 
 def _format_age(seconds: float) -> str:

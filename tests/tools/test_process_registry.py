@@ -1470,3 +1470,187 @@ class TestReaderLoopOrphanedPipe:
             except (ProcessLookupError, PermissionError):
                 pass
 
+
+# =========================================================================
+# reap_expired — lifetime cap on leaked background subprocesses (#76115)
+# =========================================================================
+
+class TestReapExpired:
+    """reap_expired tree-kills running sessions older than a max age.
+
+    A finite command (``next build``) that hangs used to run forever inside
+    the gateway cgroup and starve the event loop (#76115). reap_expired is the
+    primitive that bounds that lifetime; the lifetime-reaper thread (below)
+    invokes it periodically.
+    """
+
+    def test_kills_only_over_age_sessions(self, registry):
+        now = time.time()
+        old = _make_session(sid="proc_old", started_at=now - 100_000)
+        young = _make_session(sid="proc_young", started_at=now - 10)
+        registry._running[old.id] = old
+        registry._running[young.id] = young
+
+        killed_ids = []
+        def _fake_kill(session_id, *, source="", consume_output=True):
+            killed_ids.append((session_id, source, consume_output))
+            return {"status": "killed"}
+        registry.kill_process = _fake_kill  # type: ignore[assignment]
+
+        count = registry.reap_expired(max_age_seconds=60)
+
+        assert count == 1
+        assert killed_ids == [(old.id, "lifetime_cap", False)]
+        # The young session was spared.
+        assert young.id not in [k[0] for k in killed_ids]
+
+    def test_ignores_already_exited_sessions(self, registry):
+        now = time.time()
+        exited_old = _make_session(
+            sid="proc_exited_old", started_at=now - 100_000, exited=True,
+        )
+        registry._running[exited_old.id] = exited_old
+
+        killed = []
+        registry.kill_process = lambda *a, **k: killed.append(a) or {"status": "killed"}  # type: ignore[assignment]
+
+        assert registry.reap_expired(max_age_seconds=60) == 0
+        assert killed == []
+
+    def test_non_positive_cap_is_noop(self, registry):
+        now = time.time()
+        s = _make_session(sid="proc_cap", started_at=now - 100_000)
+        registry._running[s.id] = s
+        killed = []
+        registry.kill_process = lambda *a, **k: killed.append(a) or {"status": "killed"}  # type: ignore[assignment]
+
+        assert registry.reap_expired(max_age_seconds=0) == 0
+        assert registry.reap_expired(max_age_seconds=-5) == 0
+        assert killed == []
+
+    def test_none_cap_reads_config(self, registry, monkeypatch):
+        now = time.time()
+        s = _make_session(sid="proc_cfg", started_at=now - 100_000)
+        registry._running[s.id] = s
+        monkeypatch.setattr(
+            ProcessRegistry, "_bg_process_max_lifetime_seconds",
+            classmethod(lambda cls: 30.0),
+        )
+        killed = []
+        registry.kill_process = lambda *a, **k: killed.append(a) or {"status": "killed"}  # type: ignore[assignment]
+
+        assert registry.reap_expired() == 1
+        assert killed
+
+    def test_none_cap_with_config_disabled_is_noop(self, registry, monkeypatch):
+        now = time.time()
+        s = _make_session(sid="proc_disabled", started_at=now - 100_000)
+        registry._running[s.id] = s
+        monkeypatch.setattr(
+            ProcessRegistry, "_bg_process_max_lifetime_seconds",
+            classmethod(lambda cls: None),
+        )
+        killed = []
+        registry.kill_process = lambda *a, **k: killed.append(a) or {"status": "killed"}  # type: ignore[assignment]
+
+        assert registry.reap_expired() == 0
+        assert killed == []
+
+    def test_kill_failure_does_not_abort_sweep(self, registry):
+        now = time.time()
+        s1 = _make_session(sid="proc_boom", started_at=now - 100_000)
+        s2 = _make_session(sid="proc_ok", started_at=now - 100_000)
+        registry._running[s1.id] = s1
+        registry._running[s2.id] = s2
+
+        def _fake_kill(session_id, *, source="", consume_output=True):
+            if session_id == s1.id:
+                raise RuntimeError("kill exploded")
+            return {"status": "killed"}
+        registry.kill_process = _fake_kill  # type: ignore[assignment]
+
+        # The failing kill is swallowed; the second session is still reaped.
+        assert registry.reap_expired(max_age_seconds=60) == 1
+
+
+# =========================================================================
+# Lifetime reaper thread (#76115)
+# =========================================================================
+
+class TestLifetimeReaper:
+    def test_ensure_lifetime_reaper_is_idempotent(self, monkeypatch):
+        import tools.process_registry as pr_mod
+        stop = threading.Event()
+
+        def _blocking_loop():
+            stop.wait(10)
+        monkeypatch.setattr(pr_mod, "_lifetime_reaper_loop", _blocking_loop)
+        monkeypatch.setattr(pr_mod, "_lifetime_reaper_thread", None)
+
+        pr_mod.ensure_lifetime_reaper(max_age_seconds=100, interval_seconds=1.0)
+        t1 = pr_mod._lifetime_reaper_thread
+        assert t1 is not None and t1.is_alive()
+
+        # Second call must NOT spawn a new thread, only refresh params.
+        pr_mod.ensure_lifetime_reaper(max_age_seconds=200, interval_seconds=2.0)
+        assert pr_mod._lifetime_reaper_thread is t1
+        assert pr_mod._lifetime_reaper_max_age == 200
+        assert pr_mod._lifetime_reaper_interval == 2.0
+
+        stop.set()
+        t1.join(2)
+        assert not t1.is_alive()
+
+    def test_loop_reaps_with_configured_cap(self, monkeypatch):
+        import tools.process_registry as pr_mod
+        calls = []
+
+        monkeypatch.setattr(
+            pr_mod.ProcessRegistry, "_bg_process_max_lifetime_seconds",
+            classmethod(lambda cls: 999.0),
+        )
+        monkeypatch.setattr(
+            pr_mod.process_registry, "reap_expired",
+            lambda cap: calls.append(cap) or 0,
+        )
+        monkeypatch.setattr(pr_mod, "_lifetime_reaper_max_age", None)
+
+        # Break the infinite loop after the first reap by making the second
+        # sleep raise (BaseException escapes the ``except Exception`` guards).
+        n = {"i": 0}
+        orig_sleep = pr_mod.time.sleep
+
+        def _sleep(sec):
+            n["i"] += 1
+            if n["i"] >= 2:
+                raise KeyboardInterrupt
+            orig_sleep(0)
+        monkeypatch.setattr(pr_mod.time, "sleep", _sleep)
+
+        with pytest.raises(KeyboardInterrupt):
+            pr_mod._lifetime_reaper_loop()
+        assert calls and calls[0] == 999.0
+
+    def test_loop_swallows_reap_exceptions(self, monkeypatch):
+        """A crashing reap cycle must not kill the reaper thread."""
+        import tools.process_registry as pr_mod
+        monkeypatch.setattr(
+            pr_mod.process_registry, "reap_expired",
+            lambda cap: (_ for _ in ()).throw(RuntimeError("boom")),
+        )
+        monkeypatch.setattr(pr_mod, "_lifetime_reaper_max_age", 10.0)
+
+        n = {"i": 0}
+        orig_sleep = pr_mod.time.sleep
+
+        def _sleep(sec):
+            n["i"] += 1
+            if n["i"] >= 2:
+                raise KeyboardInterrupt
+            orig_sleep(0)
+        monkeypatch.setattr(pr_mod.time, "sleep", _sleep)
+
+        # No exception escapes despite reap_expired raising every cycle.
+        with pytest.raises(KeyboardInterrupt):
+            pr_mod._lifetime_reaper_loop()
+
