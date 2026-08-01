@@ -8946,6 +8946,41 @@ def _default_spawn(
     # here (leave the inherited value rather than write a meaningless one).
     if workspace and os.path.isabs(workspace) and os.path.isdir(workspace):
         env["TERMINAL_CWD"] = workspace
+        # Scope the worker's file-tool sandbox (write_file / patch) to this
+        # task's own workspace too. Without this every worker inherits
+        # whatever HERMES_WRITE_SAFE_ROOT the dispatcher process happened to
+        # export — a deployment-wide value that is either too narrow (blocks
+        # legitimate writes inside the task's own workspace, the Docker
+        # /opt/data default) or too wide (a worker can write into a *sibling*
+        # task's workspace). The dispatcher already knows the exact workspace
+        # it resolved for the claim, so grant the narrowest root that is
+        # correct for this task. This is a per-task file-tool constraint
+        # (defense in depth), NOT an OS security boundary — workers with
+        # ``terminal`` access can still bypass it (#36645). Fail closed: never
+        # export ``/`` (or a drive root) and never a value containing
+        # os.pathsep; on any degenerate result leave the inherited value
+        # rather than opening a wide sandbox. Mirrors the TERMINAL_CWD guard
+        # above so both derive from the same normalized path. (#70688)
+        try:
+            _ws_real = os.path.realpath(workspace)
+        except (OSError, ValueError):
+            _ws_real = workspace
+        _ws_drive_root = False
+        try:
+            _parent = os.path.dirname(_ws_real)
+            if _parent == _ws_real:  # root or drive root (e.g. "C:\\" on Windows)
+                _ws_drive_root = True
+        except (OSError, ValueError):
+            _ws_drive_root = True
+        if (
+            _ws_real
+            and _ws_real not in ("/", "\\")
+            and not _ws_drive_root
+            and os.pathsep not in _ws_real
+            and os.path.isabs(_ws_real)
+            and os.path.isdir(_ws_real)
+        ):
+            env["HERMES_WRITE_SAFE_ROOT"] = _ws_real
     if task.branch_name:
         env["HERMES_KANBAN_BRANCH"] = task.branch_name
     if task.current_run_id is not None:
