@@ -1,4 +1,7 @@
 import json
+import os
+import shutil
+import subprocess
 import tempfile
 from pathlib import Path
 
@@ -25,6 +28,34 @@ def _node_project(root: Path) -> None:
 def _make_project(root: Path) -> None:
     root.mkdir()
     _node_project(root)
+
+
+_GIT = shutil.which("git")
+requires_git = pytest.mark.skipif(_GIT is None, reason="git not installed")
+
+
+def _git_run(repo: Path, *args: str) -> None:
+    env = {
+        **os.environ,
+        "GIT_AUTHOR_NAME": "t",
+        "GIT_AUTHOR_EMAIL": "t@t",
+        "GIT_COMMITTER_NAME": "t",
+        "GIT_COMMITTER_EMAIL": "t@t",
+        "HOME": str(repo),
+    }
+    subprocess.run(
+        [_GIT, "-C", str(repo), *args],
+        check=True,
+        env=env,
+        capture_output=True,
+    )
+
+
+def _git_init_and_commit(repo: Path) -> None:
+    """Init a repo and commit its current contents so the tree starts clean."""
+    _git_run(repo, "init", "-q", "-b", "main")
+    _git_run(repo, "add", "-A")
+    _git_run(repo, "commit", "-q", "-m", "init")
 
 
 @pytest.fixture
@@ -233,3 +264,66 @@ def test_is_non_code_path_classification():
     assert _is_non_code_path("src/app.ts") is False
     assert _is_non_code_path("config.yaml") is False
     assert _is_non_code_path("run_agent.py") is False
+
+
+# ---------------------------------------------------------------------------
+# #80274: files edited and already committed are not "unverified edits" —
+# verify-on-stop gates uncommitted working-tree changes, not history.
+# ---------------------------------------------------------------------------
+
+
+@requires_git
+def test_nudge_suppressed_when_edits_already_committed(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    _node_project(tmp_path)
+    target = tmp_path / "src" / "app.ts"
+    target.parent.mkdir(parents=True)
+    target.write_text("export const ok = true\n", encoding="utf-8")
+    _git_init_and_commit(tmp_path)  # commit everything → clean working tree
+
+    # Simulate the agent having edited (now committed) code without fresh proof.
+    mark_workspace_edited(session_id="s1", cwd=tmp_path, paths=[str(target)])
+
+    nudge = build_verify_on_stop_nudge(session_id="s1", changed_paths=[str(target)])
+    assert nudge is None
+
+
+@requires_git
+def test_nudge_fires_for_uncommitted_edit(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    _node_project(tmp_path)
+    _git_init_and_commit(tmp_path)  # clean baseline
+    target = tmp_path / "src" / "app.ts"
+    target.parent.mkdir(parents=True)
+    target.write_text("export const ok = true\n", encoding="utf-8")
+    # NOT committed → working tree is dirty.
+
+    mark_workspace_edited(session_id="s1", cwd=tmp_path, paths=[str(target)])
+
+    nudge = build_verify_on_stop_nudge(session_id="s1", changed_paths=[str(target)])
+    assert nudge is not None
+    assert str(target) in nudge
+
+
+@requires_git
+def test_nudge_only_lists_uncommitted_paths_when_mixed(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    _node_project(tmp_path)
+    committed = tmp_path / "src" / "committed.ts"
+    committed.parent.mkdir(parents=True)
+    committed.write_text("export const a = 1\n", encoding="utf-8")
+    _git_init_and_commit(tmp_path)  # committed.ts is now committed (clean)
+
+    dirty = tmp_path / "src" / "dirty.ts"
+    dirty.write_text("export const b = 2\n", encoding="utf-8")  # uncommitted
+
+    mark_workspace_edited(
+        session_id="s1", cwd=tmp_path, paths=[str(committed), str(dirty)]
+    )
+
+    nudge = build_verify_on_stop_nudge(
+        session_id="s1", changed_paths=[str(committed), str(dirty)]
+    )
+    assert nudge is not None
+    assert str(dirty) in nudge
+    assert str(committed) not in nudge

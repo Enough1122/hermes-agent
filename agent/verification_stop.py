@@ -72,6 +72,60 @@ def _filter_verifiable_paths(paths: Iterable[str]) -> list[str]:
     return [p for p in paths if p and not _is_non_code_path(p)]
 
 
+def _filter_to_uncommitted(paths: list[str]) -> list[str]:
+    """Keep only paths with uncommitted (git-dirty) working-tree changes.
+
+    A file edited and already committed is no longer an "unverified edit" —
+    verify-on-stop gates working-tree changes, not history, so a clean tree
+    has nothing to verify (#80274). Paths outside any git repo, or when the
+    git probe fails, are kept rather than falsely suppressing the nudge.
+    """
+    try:
+        from agent.coding_context import _git, _git_root
+    except Exception:
+        return list(paths)
+
+    dirty_by_root: dict[str, set[str]] = {}
+    kept: list[str] = []
+    for raw in paths:
+        try:
+            resolved = str(Path(raw).expanduser().resolve())
+            root = _git_root(Path(resolved).parent)
+        except Exception:
+            kept.append(raw)
+            continue
+        if root is None:
+            # Not a git repo — commit state is unknowable; keep the path.
+            kept.append(raw)
+            continue
+        root_key = str(root)
+        if root_key not in dirty_by_root:
+            porcelain = _git(
+                Path(root_key),
+                "status",
+                "--porcelain=1",
+                "--untracked-files=all",
+            )
+            dirty: set[str] = set()
+            for line in porcelain.splitlines():
+                # porcelain v1: "XY path" (rename: "XY orig -> dest"); path at index 3.
+                path_part = line[3:] if len(line) >= 4 else ""
+                if " -> " in path_part:
+                    path_part = path_part.split(" -> ", 1)[1]
+                if len(path_part) >= 2 and path_part[0] == '"' and path_part[-1] == '"':
+                    path_part = path_part[1:-1]
+                if not path_part:
+                    continue
+                try:
+                    dirty.add(os.path.normcase(str((Path(root_key) / path_part).resolve())))
+                except Exception:
+                    continue
+            dirty_by_root[root_key] = dirty
+        if os.path.normcase(resolved) in dirty_by_root[root_key]:
+            kept.append(raw)
+    return kept
+
+
 def _session_is_messaging_surface() -> bool:
     """Whether this turn is delivered over a human messaging channel.
 
@@ -215,6 +269,12 @@ def build_verify_on_stop_nudge(
     # nothing to verify and must not nudge.
     paths = sorted({str(p) for p in _filter_verifiable_paths(changed_paths)})
     if not paths or attempts >= max_attempts:
+        return None
+    # Drop paths whose edits are already committed (clean working tree) —
+    # verify-on-stop gates uncommitted working-tree changes, not history. A
+    # file edited and committed is no longer an "unverified edit" (#80274).
+    paths = _filter_to_uncommitted(paths)
+    if not paths:
         return None
 
     snapshot = _verification_snapshot(session_id=session_id, changed_paths=paths)

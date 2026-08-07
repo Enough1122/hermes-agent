@@ -156,6 +156,21 @@ class TestProjectFacts:
         assert facts.verify_commands == ["pnpm run test"]  # dev excluded
         assert facts.context_files == []
 
+    def test_detect_pytest_from_setup_cfg(self, tmp_path):
+        # pytest configured via setup.cfg [tool:pytest] must be detected as a
+        # verify command — otherwise direct `pytest` runs are never classified
+        # as verification evidence and the last_event_id pointer goes stale
+        # (#80274).
+        (tmp_path / "setup.cfg").write_text("[tool:pytest]\ntestpaths = tests\n")
+        facts = cc.detect_project_facts(tmp_path)
+        assert "pytest" in facts.verify_commands
+
+    def test_detect_pytest_from_tox_ini(self, tmp_path):
+        # Same gap for tox.ini [pytest] (#80274).
+        (tmp_path / "tox.ini").write_text("[pytest]\ntestpaths = tests\n")
+        facts = cc.detect_project_facts(tmp_path)
+        assert "pytest" in facts.verify_commands
+
     def test_project_facts_for_matches_prompt_block(self, tmp_path):
         # Invariant: the structured facts the UI consumes must not drift from the
         # commands the prompt snapshot renders — one detector feeds both.
