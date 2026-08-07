@@ -799,7 +799,18 @@ def detect_project_facts(root: Path) -> ProjectFacts:
             scripts = {}
         js_pm = next((pm for lock, pm in _JS_LOCKFILES if (root / lock).is_file()), "npm")
         verify.extend(f"{js_pm} run {name}" for name in _VERIFY_TARGETS if name in scripts)
-    if (root / "pytest.ini").is_file() or "[tool.pytest" in _read_small(root / "pyproject.toml"):
+    # pytest reads its ini config from pytest.ini, pyproject.toml
+    # ([tool.pytest.ini_options]), tox.ini ([pytest]) or setup.cfg
+    # ([tool:pytest]). Only the first two were sniffed, so a project that
+    # configures pytest via setup.cfg/tox.ini had no detected verify command —
+    # direct `pytest` runs were then never classified as verification evidence,
+    # leaving the last_event_id pointer stale (#80274).
+    if (
+        (root / "pytest.ini").is_file()
+        or "[tool.pytest" in _read_small(root / "pyproject.toml")
+        or "[tool:pytest]" in _read_small(root / "setup.cfg")
+        or "[pytest]" in _read_small(root / "tox.ini")
+    ):
         verify.append("pytest")
     makefile = _read_small(root / "Makefile")
     if makefile:
