@@ -31,8 +31,8 @@ import {
   writeDesktopFileText
 } from '@/lib/desktop-fs'
 import { Check, Pencil, X } from '@/lib/icons'
-import { findHeadingByHash, rehypeHeadingIds } from '@/lib/markdown-heading-ids'
 import { shikiLanguageForFilename } from '@/lib/markdown-code'
+import { findHeadingByHash, rehypeHeadingIds } from '@/lib/markdown-heading-ids'
 import { cn } from '@/lib/utils'
 import type { PreviewTarget } from '@/store/preview'
 import { setPreviewDirty } from '@/store/preview-edit'
