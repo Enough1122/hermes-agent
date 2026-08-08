@@ -20,9 +20,12 @@ list of files that did NOT change.
 from __future__ import annotations
 
 import json
+import os
+from pathlib import Path
 
 import pytest
 
+import run_agent
 from run_agent import (
     AIAgent,
     _FILE_MUTATING_TOOLS,
@@ -312,6 +315,141 @@ class TestVerifierEnabled:
         monkeypatch.setenv("HERMES_FILE_MUTATION_VERIFIER", value)
         agent = _bare_agent()
         assert agent._file_mutation_verifier_enabled() is False
+
+
+# ---------------------------------------------------------------------------
+# _record_file_mutation_result — worktree/session cwd resolution (#81650)
+# ---------------------------------------------------------------------------
+
+
+class TestRecordFileMutationResultWorktreeCwd:
+    """Regression (#81650): mutation targets must resolve against the
+    SESSION/worktree cwd, not the agent PROCESS cwd.
+
+    In a linked git worktree the session cwd (``/…/hermes-agent-pr-252``)
+    differs from ``os.getcwd()`` (the main checkout where the agent process
+    launched).  A failed repo-relative patch (``tests/agent/x.py``) used to
+    be keyed on that raw relative string, while a later successful write
+    reported the tool's resolved ABSOLUTE path — the two never unify, so the
+    failure was never cleared and the file was falsely reported as NOT
+    modified.
+    """
+
+    def _agent(self) -> AIAgent:
+        return _bare_agent()
+
+    def test_failure_keyed_under_worktree_cwd(self, monkeypatch, tmp_path):
+        worktree = tmp_path / "hermes-agent-pr-252"
+        worktree.mkdir()
+        monkeypatch.setattr(run_agent, "_mutation_verifier_cwd", lambda: worktree)
+        agent = self._agent()
+        agent._record_file_mutation_result(
+            "patch",
+            {"mode": "replace", "path": "tests/agent/x.py", "old_string": "a", "new_string": "b"},
+            json.dumps({"error": "Could not find old_string"}),
+            is_error=True,
+        )
+        key = str(worktree / "tests/agent/x.py")
+        assert key in agent._turn_failed_file_mutations
+        # The raw relative spelling must NOT leak into the failure dict — a
+        # later absolute-path success would never clear it.
+        assert "tests/agent/x.py" not in agent._turn_failed_file_mutations
+
+    def test_absolute_success_clears_relative_failure(self, monkeypatch, tmp_path):
+        worktree = tmp_path / "hermes-agent-pr-252"
+        worktree.mkdir()
+        monkeypatch.setattr(run_agent, "_mutation_verifier_cwd", lambda: worktree)
+        agent = self._agent()
+        # First attempt fails with a repo-relative target.
+        agent._record_file_mutation_result(
+            "patch",
+            {"mode": "replace", "path": "tests/agent/x.py", "old_string": "a", "new_string": "b"},
+            json.dumps({"error": "Could not find old_string"}),
+            is_error=True,
+        )
+        key = str(worktree / "tests/agent/x.py")
+        assert key in agent._turn_failed_file_mutations
+
+        # Later success reports the tool's resolved ABSOLUTE path (the session
+        # cwd is the worktree, not the process cwd).  It must clear the failure
+        # recorded under the relative spelling.
+        agent._record_file_mutation_result(
+            "patch",
+            {"mode": "replace", "path": "tests/agent/x.py", "old_string": "a", "new_string": "b"},
+            json.dumps({"success": True, "diff": "...", "files_modified": [key]}),
+            is_error=False,
+        )
+        assert agent._turn_failed_file_mutations == {}
+        assert key in agent._turn_file_mutation_paths
+
+    def test_relative_resolution_depends_on_session_cwd_not_process_cwd(self, monkeypatch, tmp_path):
+        # Two different session cwds must yield two distinct canonical keys for
+        # the same relative target — verifying the resolution is anchored to
+        # the session cwd, not to the agent process cwd (which is shared).
+        wt_a = tmp_path / "checkout-a"
+        wt_b = tmp_path / "checkout-b"
+        wt_a.mkdir()
+        wt_b.mkdir()
+
+        def _record(session_wt):
+            monkeypatch.setattr(run_agent, "_mutation_verifier_cwd", lambda: session_wt)
+            ag = self._agent()
+            ag._record_file_mutation_result(
+                "patch",
+                {"mode": "replace", "path": "tests/agent/x.py", "old_string": "a", "new_string": "b"},
+                json.dumps({"error": "nope"}),
+                is_error=True,
+            )
+            return ag._turn_failed_file_mutations
+
+        fa = _record(wt_a)
+        fb = _record(wt_b)
+        assert str(wt_a / "tests/agent/x.py") in fa
+        assert str(wt_b / "tests/agent/x.py") in fb
+        assert set(fa) != set(fb)
+        assert "tests/agent/x.py" not in fa
+        assert "tests/agent/x.py" not in fb
+
+    def test_absolute_and_relative_target_unify_for_same_session(self, monkeypatch, tmp_path):
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+        monkeypatch.setattr(run_agent, "_mutation_verifier_cwd", lambda: worktree)
+        agent = self._agent()
+        key = str(worktree / "docs/a.md")
+        # Fail via V4A patch whose header is repo-relative.
+        body = "***Begin Patch\n*** Update File: docs/a.md\n-a\n+b\n***End Patch\n"
+        agent._record_file_mutation_result(
+            "patch",
+            {"mode": "patch", "patch": body},
+            json.dumps({"error": "apply failed"}),
+            is_error=True,
+        )
+        assert key in agent._turn_failed_file_mutations
+        # A later failure using the ABSOLUTE spelling of the same file must
+        # overwrite (keep-first) under the SAME key, not create a second entry.
+        agent._record_file_mutation_result(
+            "patch",
+            {"mode": "replace", "path": key, "old_string": "a", "new_string": "x"},
+            json.dumps({"error": "still failing"}),
+            is_error=True,
+        )
+        assert agent._turn_failed_file_mutations == {key: agent._turn_failed_file_mutations[key]}
+        assert "first error" not in agent._turn_failed_file_mutations[key]["error_preview"]
+        assert "apply failed" in agent._turn_failed_file_mutations[key]["error_preview"]
+
+    def test_single_checkout_absolute_path_unchanged(self, monkeypatch, tmp_path):
+        # When the session cwd equals the process cwd (single checkout) an
+        # absolute target passes through unchanged (base is irrelevant).
+        worktree = Path(os.getcwd())
+        monkeypatch.setattr(run_agent, "_mutation_verifier_cwd", lambda: worktree)
+        agent = self._agent()
+        agent._record_file_mutation_result(
+            "patch",
+            {"mode": "replace", "path": "/tmp/a.md", "old_string": "a", "new_string": "b"},
+            json.dumps({"error": "no"}),
+            is_error=True,
+        )
+        assert "/tmp/a.md" in agent._turn_failed_file_mutations
 
 
 

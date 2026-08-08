@@ -409,6 +409,60 @@ class _StreamErrorEvent(Exception):
         }
 
 
+# ---------------------------------------------------------------------------
+# File-mutation verifier path canonicalization.
+#
+# The verifier keys its per-turn failure state on the concrete file a
+# ``write_file`` / ``patch`` reports, which may arrive as a repo-relative
+# string (``tests/agent/x.py`` from the tool-call args) or as an absolute
+# path (``/…/hermes-agent-pr-252/tests/agent/x.py``, the tool's resolved
+# result).  Unresolved, those spellings never unify: a failure keyed on the
+# relative string is not cleared by a later success reporting the absolute
+# path, so a linked git-worktree session (whose cwd differs from the agent
+# PROCESS cwd) falsely reports the file as NOT modified.
+# ---------------------------------------------------------------------------
+
+
+def _mutation_verifier_cwd() -> Path:
+    """Absolute session/worktree cwd the verifier resolves targets against.
+
+    Delegates to ``resolve_agent_cwd`` (agent/runtime_cwd.py), the single
+    source of truth for the agent working directory: it prefers the session's
+    pinned cwd (gateway/ACP), then the sentinel-free ``TERMINAL_CWD`` (the
+    worktree path), and only as a last resort the agent process cwd.  Imported
+    lazily to avoid a module-load cycle.
+    """
+    try:
+        from agent.runtime_cwd import resolve_agent_cwd
+        return resolve_agent_cwd()
+    except Exception:
+        return Path(os.getcwd())
+
+
+def _canonical_mutation_path(raw: Any, base: Path) -> str:
+    """Return a canonical absolute key for a mutation target path.
+
+    Absolute targets pass through unchanged; bare relative targets are resolved
+    against ``base`` (the session/worktree cwd) so they unify with the tool's
+    own absolute ``resolved_path`` / ``files_modified`` result.  A leading
+    ``/`` (or ``\\``) is treated as root-anchored even on Windows, where
+    Python's ``Path.is_absolute()`` misclassifies ``/tmp/a.md`` as relative
+    and would otherwise anchor it under ``base``; its original spelling is
+    preserved so it still round-trips against the tool's result.  Returns ""
+    for empty/blank values so callers can drop them.
+    """
+    text = "" if raw is None else str(raw)
+    text = text.strip()
+    if not text:
+        return ""
+    p = Path(text).expanduser()
+    if text.startswith(("/", "\\")):
+        return text
+    if p.is_absolute():
+        return str(p)
+    return str(base / p)
+
+
 class AIAgent:
     """
     AI Agent with tool calling capabilities.
@@ -3432,6 +3486,17 @@ class AIAgent:
         model recovered within the turn).  Silently no-ops if the per-turn
         state dict hasn't been initialised yet (e.g. a tool dispatched
         outside ``run_conversation``).
+
+        Every path — the failure keys and the landed paths reported by a
+        successful mutation — is canonicalized to an absolute path resolved
+        against the SESSION/worktree cwd (``resolve_agent_cwd``) before it is
+        used as a dict key / set member.  That is what lets a repo-relative
+        target (``tests/agent/x.py``) and the tool's resolved absolute path
+        (``/…/hermes-agent-pr-252/tests/agent/x.py``) refer to the same file:
+        without this, a failure keyed on the raw relative string is never
+        cleared by a later success that reports the absolute path, and the
+        verifier falsely reports the file as NOT modified in a linked worktree
+        whose cwd differs from the agent process cwd (#81650).
         """
         if tool_name not in _FILE_MUTATING_TOOLS:
             return
@@ -3441,25 +3506,46 @@ class AIAgent:
         targets = _extract_file_mutation_targets(tool_name, args)
         if not targets:
             return
+
+        # Resolve repo-relative targets against the session/worktree cwd so
+        # relative and absolute spellings of the same file unify under one
+        # canonical key.  ``resolve_agent_cwd`` prefers the pinned session cwd
+        # (gateway/ACP) → ``TERMINAL_CWD`` (worktree path) → the process cwd
+        # as a last resort, so single-checkout behaviour is unchanged.
+        base = _mutation_verifier_cwd()
+
+        def _canon(path: Any) -> str:
+            return _canonical_mutation_path(path, base)
+
         landed = file_mutation_result_landed(tool_name, result)
         if landed:
             changed = getattr(self, "_turn_file_mutation_paths", None)
             if changed is not None:
-                changed.update(_extract_landed_file_mutation_paths(tool_name, args, result))
+                changed.update(
+                    _canon(p) for p in
+                    _extract_landed_file_mutation_paths(tool_name, args, result)
+                    if _canon(p)
+                )
+
         if is_error and not landed:
             preview = _extract_error_preview(result)
             for path in targets:
+                key = _canon(path)
+                if not key:
+                    continue
                 # Keep the FIRST error we saw for a given path unless we
                 # later see success.  A repeated failure with a different
                 # message shouldn't silently overwrite the original.
-                if path not in state:
-                    state[path] = {
+                if key not in state:
+                    state[key] = {
                         "tool": tool_name,
                         "error_preview": preview,
                     }
         else:
             for path in targets:
-                state.pop(path, None)
+                key = _canon(path)
+                if key:
+                    state.pop(key, None)
 
     def _file_mutation_verifier_enabled(self) -> bool:
         """Check whether the per-turn file-mutation verifier footer is on.
