@@ -108,7 +108,20 @@ def run_setup(provider, hermes_home: str, config: dict) -> None:
     # Environment-aware install: sealed hosted venvs redirect to the durable data volume.
     from tools.lazy_deps import install_specs
 
-    deps = ["hindsight-all"] if mode == "local_embedded" else [f"hindsight-client>={_MIN_CLIENT_VERSION}"]
+    # The bare full bundle is not portable to Intel macOS: its current
+    # dependencies pull MLX packages with no x86_64 wheels, so the
+    # resolver backtracks to ancient releases that break the configured
+    # ONNX runtime (#81421).  On that platform install the thin slim
+    # stack instead, matching ``_provider_pip_dependencies``.
+    if mode == "local_embedded":
+        from hermes_cli.memory_setup import _is_intel_macos
+
+        if _is_intel_macos():
+            deps = ["hindsight-all-slim", "hindsight-api-slim[local-onnx]"]
+        else:
+            deps = ["hindsight-all"]
+    else:
+        deps = [f"hindsight-client>={_MIN_CLIENT_VERSION}"]
     outcome = install_specs(deps, timeout=120)
     if outcome.ok:
         print("  ✓ Dependencies up to date")

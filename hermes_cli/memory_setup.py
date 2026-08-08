@@ -17,7 +17,9 @@ _IMPORT_NAMES = {
     "honcho-ai": "honcho",
     "mem0ai": "mem0",
     "hindsight-client": "hindsight_client",
-    "hindsight-all": "hindsight"}
+    "hindsight-all": "hindsight",
+    "hindsight-all-slim": "hindsight_all_slim",
+    "hindsight-api-slim": "hindsight_api_slim"}
 
 
 def _provider_pip_dependencies(provider_name: str, declared: list) -> list:
