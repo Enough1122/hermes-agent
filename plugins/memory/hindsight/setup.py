@@ -117,7 +117,14 @@ def run_setup(provider, hermes_home: str, config: dict) -> None:
         from hermes_cli.memory_setup import _is_intel_macos
 
         if _is_intel_macos():
-            deps = ["hindsight-all-slim", "hindsight-api-slim[local-onnx]"]
+            deps = [
+                "hindsight-all-slim",
+                "hindsight-api-slim[local-onnx]",
+                # Same explicit embed spec as ``_provider_pip_dependencies``:
+                # the embed manager drives the configured ONNX embeddings
+                # provider and must be declared, not assumed.
+                "hindsight-embed",
+            ]
         else:
             deps = ["hindsight-all"]
     else:
