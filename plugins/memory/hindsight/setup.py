@@ -114,19 +114,12 @@ def run_setup(provider, hermes_home: str, config: dict) -> None:
     # ONNX runtime (#81421).  On that platform install the thin slim
     # stack instead, matching ``_provider_pip_dependencies``.
     if mode == "local_embedded":
-        from hermes_cli.memory_setup import _is_intel_macos
+        # Single source of truth shared with the refresh/heal path
+        # (``_provider_pip_dependencies``): selects the slim stack on Intel
+        # macOS and the full bundle elsewhere (#81421, #81530).
+        from hermes_cli.memory_setup import _hindsight_local_embedded_deps
 
-        if _is_intel_macos():
-            deps = [
-                "hindsight-all-slim",
-                "hindsight-api-slim[local-onnx]",
-                # Same explicit embed spec as ``_provider_pip_dependencies``:
-                # the embed manager drives the configured ONNX embeddings
-                # provider and must be declared, not assumed.
-                "hindsight-embed",
-            ]
-        else:
-            deps = ["hindsight-all"]
+        deps = _hindsight_local_embedded_deps()
     else:
         deps = [f"hindsight-client>={_MIN_CLIENT_VERSION}"]
     outcome = install_specs(deps, timeout=120)
