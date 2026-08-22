@@ -855,12 +855,6 @@ class UpdateTaskBody(BaseModel):
     # override doesn't silently reset the depth the operator chose.
     reasoning_effort: Optional[str] = None
     clear_reasoning_effort: bool = False
-    # Opt-in confirmation probe (#82689): with ``dry_run=true`` and an
-    # ``assignee`` field, nothing is mutated — the handler returns what
-    # WOULD happen (target profile exists, task state, current claim,
-    # whether assignment starts execution immediately) so the UI can ask
-    # before applying. Default false keeps today's behavior byte-for-byte.
-    dry_run: bool = False
 
 
 def _reopen_if_review(conn, task_id: str, current) -> Optional[bool]:
@@ -893,7 +887,9 @@ def _dashboard_operator() -> str:
     must not leak into the audit log. When plugin_api runs outside the
     dashboard server process (tests, direct ASGI mounts) there is no token
     to hash, so identity falls back to the serving process's ``host:pid``.
-    Cached per-process; the token is fixed for the server's lifetime.
+    A token-derived identity is cached per-process because the token is fixed
+    for the server's lifetime.  The fallback is deliberately not cached: this
+    module can be imported before ``web_server`` creates ``_SESSION_TOKEN``.
     """
     global _DASHBOARD_OPERATOR
     if _DASHBOARD_OPERATOR:
@@ -906,115 +902,14 @@ def _dashboard_operator() -> str:
     if token:
         session = hashlib.sha256(str(token).encode("utf-8")).hexdigest()[:12]
         operator = f"dashboard:{session}"
+        _DASHBOARD_OPERATOR = operator
+        return operator
     else:
         try:
             host = socket.gethostname() or "unknown"
         except Exception:
             host = "unknown"
-        operator = f"dashboard:{host}:{os.getpid()}"
-
-    _DASHBOARD_OPERATOR = operator
-    return operator
-
-
-def _profile_exists(name: Optional[str]) -> Optional[bool]:
-    """Whether ``name`` resolves to a real Hermes profile. ``None`` when no
-    profile was requested (unassign). Best-effort: an import failure must
-    never break the probe."""
-    if not name:
-        return None
-    try:
-        from hermes_cli.profiles import profile_exists
-
-        return bool(profile_exists(name))
-    except Exception:
-        return None
-
-
-def _assign_probe(
-    conn,
-    task_id: str,
-    profile: Optional[str],
-    *,
-    reclaim_first: bool = False,
-) -> dict:
-    """Read-only dry-run probe for an assign/reassign (#82689).
-
-    Returns what WOULD happen without touching any row, so the UI can ask
-    for confirmation before applying an assign that starts execution
-    immediately (unassigned cards are never dispatched — assigning one is
-    the moment work begins).
-    """
-    row = conn.execute(
-        "SELECT status, claim_lock, assignee FROM tasks WHERE id = ?",
-        (task_id,),
-    ).fetchone()
-
-    probe: dict[str, Any] = {
-        "task_id": task_id,
-        "task_exists": row is not None,
-        "current_status": row["status"] if row else None,
-        "current_assignee": row["assignee"] if row else None,
-        "claim_locked": bool(row and row["claim_lock"]),
-        "running": bool(
-            row and row["claim_lock"] is not None and row["status"] == "running"
-        ),
-        "target_profile": profile,
-        "target_profile_exists": _profile_exists(profile),
-        "would_reclaim": False,
-        "would_refuse": False,
-        "parents_satisfied": True,
-        "dispatchable_after_assign": False,
-        "warnings": [],
-    }
-
-    if row is None:
-        probe["would_refuse"] = True
-        probe["warnings"].append(f"no such task: {task_id}")
-        return probe
-
-    running = probe["running"]
-    if running:
-        # Mirrors assign_task's guard: refuses while claimed+running.
-        if reclaim_first:
-            probe["would_reclaim"] = True
-            probe["warnings"].append(
-                "the active worker claim would be released before reassigning"
-            )
-        else:
-            probe["would_refuse"] = True
-            probe["warnings"].append(
-                "task is currently running — assignment would be refused "
-                "(pass reclaim_first to release the claim)"
-            )
-
-    # Parent invariant from claim_task: a ready task with undone parents is
-    # demoted back to todo instead of being claimed.
-    if profile is not None:
-        undone = conn.execute(
-            "SELECT 1 FROM task_links l "
-            "JOIN tasks p ON p.id = l.parent_id "
-            "WHERE l.child_id = ? AND p.status NOT IN ('done', 'archived') LIMIT 1",
-            (task_id,),
-        ).fetchone()
-        probe["parents_satisfied"] = undone is None
-
-    effective_status = "ready" if (
-        not running or reclaim_first
-    ) else probe["current_status"]
-    probe["dispatchable_after_assign"] = bool(
-        not probe["would_refuse"]
-        and effective_status == "ready"
-        and profile is not None
-        and probe["target_profile_exists"]
-        and probe["parents_satisfied"]
-    )
-    if probe["dispatchable_after_assign"]:
-        probe["warnings"].append(
-            "assignment starts execution immediately: the dispatcher will "
-            "claim this task and spawn the assigned profile on its next tick"
-        )
-    return probe
+        return f"dashboard:{host}:{os.getpid()}"
 
 
 @router.patch("/tasks/{task_id}")
@@ -1029,26 +924,6 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
         review_assignee_deferred = (
             payload.status == "review" and payload.assignee is not None
         )
-
-        # --- dry-run probe (#82689) ---------------------------------------
-        # Confirmation is opt-in per request: only the assign path supports
-        # it, and nothing below runs when it fires.
-        if payload.dry_run:
-            if payload.assignee is None or payload.status is not None:
-                raise HTTPException(
-                    status_code=400,
-                    detail=(
-                        "dry_run=true is only supported for a pure assignee "
-                        "patch (no status/other fields)"
-                    ),
-                )
-            probe = _assign_probe(conn, task_id, payload.assignee or None)
-            return {
-                "ok": bool(probe["task_exists"] and not probe["would_refuse"]),
-                "dry_run": True,
-                "task_id": task_id,
-                "probe": probe,
-            }
 
         # --- assignee ----------------------------------------------------
         # For a combined assignee+review patch, request_review must capture
@@ -2023,11 +1898,6 @@ class ReassignBody(BaseModel):
     profile: Optional[str] = None  # "" or None = unassign
     reclaim_first: bool = False
     reason: Optional[str] = None
-    # Opt-in confirmation probe (#82689): with dry_run=true nothing is
-    # mutated — the response reports what WOULD happen (task state, current
-    # claim, target profile existence, whether assignment starts execution
-    # immediately) so the UI can confirm before applying.
-    dry_run: bool = False
 
 
 @router.post("/tasks/{task_id}/reassign")
@@ -2043,26 +1913,10 @@ def reassign_task_endpoint(
     smarter model after the assigned profile keeps hallucinating).
     Maps 1:1 to ``hermes kanban reassign <task_id> <profile> [--reclaim]``.
 
-    With ``dry_run=true`` the endpoint is a read-only probe: it returns
-    ``{ok, dry_run, task_id, probe}`` describing what the real call would
-    do — including whether the assign would be refused (running claim,
-    unknown task) and whether the dispatcher would pick the card up on its
-    next tick. The default (dry_run=false) behavior is unchanged.
     """
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
-        if payload.dry_run:
-            probe = _assign_probe(
-                conn, task_id, payload.profile or None,
-                reclaim_first=bool(payload.reclaim_first),
-            )
-            return {
-                "ok": bool(probe["task_exists"] and not probe["would_refuse"]),
-                "dry_run": True,
-                "task_id": task_id,
-                "probe": probe,
-            }
         ok = kanban_db.reassign_task(
             conn, task_id,
             payload.profile or None,
