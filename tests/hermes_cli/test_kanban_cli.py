@@ -251,7 +251,7 @@ def test_run_slash_reclaim_running_task(kanban_home):
 def test_cli_assign_claim_complete_stamp_operator(kanban_home):
     """The mutating CLI verbs record a ``cli:<user>@<host>`` operator on
     the assigned / claimed / completed event payloads (issue #82689)."""
-    with kb.connect_closing() as conn:
+    with kbc.connect_closing() as conn:
         tid = kb.create_task(conn, title="audit me")
 
     assert "Assigned" in kc.run_slash(f"assign {tid} bob")
@@ -262,7 +262,7 @@ def test_cli_assign_claim_complete_stamp_operator(kanban_home):
     assert expected.startswith("cli:")
     assert "@" in expected
 
-    with kb.connect_closing() as conn:
+    with kbc.connect_closing() as conn:
         payloads = {}
         for e in kb.list_events(conn, tid):
             if e.kind in {"assigned", "claimed", "completed"}:
@@ -278,12 +278,12 @@ def test_cli_assign_claim_complete_stamp_operator(kanban_home):
 
 
 def test_cli_reassign_stamps_operator(kanban_home):
-    with kb.connect_closing() as conn:
+    with kbc.connect_closing() as conn:
         tid = kb.create_task(conn, title="reassign me")
 
     assert "Reassigned" in kc.run_slash(f"reassign {tid} carol")
 
-    with kb.connect_closing() as conn:
+    with kbc.connect_closing() as conn:
         assigned = [
             e.payload for e in kb.list_events(conn, tid)
             if e.kind == "assigned"

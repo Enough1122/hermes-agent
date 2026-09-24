@@ -2025,7 +2025,7 @@ def test_assign_event_operator_is_additive(kanban_home):
     """operator= rides the ``assigned`` payload additively; a caller that
     omits it must get the exact legacy payload (no new key), so old rows
     and old consumers are unaffected (issue #82689)."""
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         t_new = kb.create_task(conn, title="with operator")
         assert kb.assign_task(
             conn, t_new, "bob", operator="cli:amy@box"
@@ -2046,7 +2046,7 @@ def test_assign_event_operator_is_additive(kanban_home):
 def test_claim_and_complete_events_carry_operator(kanban_home):
     """claimed / completed payloads gain ``operator`` only when the caller
     passes one; the legacy key sets are untouched otherwise."""
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         t = kb.create_task(conn, title="attributed")
         claimed = kb.claim_task(
             conn, t, claimer="box:1", operator="cli:a@b"
@@ -2078,19 +2078,23 @@ def test_claim_and_complete_events_carry_operator(kanban_home):
 
 
 def test_dispatcher_claim_stamps_dispatcher_operator(
-    kanban_home, all_assignees_spawnable,
+    kanban_home, all_assignees_spawnable, monkeypatch,
 ):
     """Auto-spawn claims must record dispatcher identity so forensics can
     tell them apart from manual ``hermes kanban claim`` (issue #82689)."""
+    # Hermetic against in-file test order: earlier tests park fake Popen
+    # handles in the module-global live-worker registry, and the reclaim
+    # phase polls them. Give this dispatch a clean registry.
+    monkeypatch.setattr(kbd, "_live_worker_procs", {})
     spawns: list[str] = []
 
     def fake_spawn(task, workspace, board=None):
         spawns.append(task.id)
         return 42
 
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         tid = kb.create_task(conn, title="auto-spawned", assignee="alice")
-        res = kb.dispatch_once(conn, spawn_fn=fake_spawn)
+        res = kbd.dispatch_once(conn, spawn_fn=fake_spawn)
 
     assert res.spawned and spawns == [tid]
     payloads = _payloads_of_kind(conn, tid, "claimed")
