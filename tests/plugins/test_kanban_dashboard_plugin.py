@@ -1195,3 +1195,64 @@ def test_patch_dry_run_requires_pure_assignee_patch(client):
         json={"dry_run": True},
     )
     assert resp.status_code == 400
+
+
+def test_patch_expect_preconditions_refuses_stale_board(client):
+    """Invariant: an apply request carrying the probe's ``preconditions`` is
+    refused with 409 when the row moved between probe and apply — the UI can
+    never silently apply a stale confirmation plan (#82689 probe→apply TOCTOU).
+    Red on base: the stale ``expect`` was ignored and the assign landed."""
+    r = client.post("/api/plugins/kanban/tasks", json={"title": "card"})
+    task_id = r.json()["task"]["id"]
+    url = f"/api/plugins/kanban/tasks/{task_id}"
+
+    resp = client.patch(url, json={"assignee": "builder", "dry_run": True})
+    pre = resp.json()["probe"]["preconditions"]
+    assert pre == {"status": "ready", "claim_lock": None, "assignee": None}
+
+    # The board moves underneath the confirmation: someone else assigns first.
+    assert client.patch(url, json={"assignee": "other"}).status_code == 200
+
+    resp = client.patch(url, json={"assignee": "builder", "expect": pre})
+    assert resp.status_code == 409, resp.text
+    assert "board moved since the dry-run probe" in resp.json()["detail"]
+    with kb.connect() as conn:
+        assert kb.get_task(conn, task_id).assignee == "other"  # apply was refused
+
+
+def test_patch_expect_preconditions_pass_when_board_unchanged(client):
+    """Invariant: echoing the probe's ``preconditions`` back on an unchanged
+    board applies normally — the guard only fires on a real mismatch."""
+    r = client.post("/api/plugins/kanban/tasks", json={"title": "card"})
+    task_id = r.json()["task"]["id"]
+    url = f"/api/plugins/kanban/tasks/{task_id}"
+
+    resp = client.patch(url, json={"assignee": "builder", "dry_run": True})
+    pre = resp.json()["probe"]["preconditions"]
+
+    resp = client.patch(url, json={"assignee": "builder", "expect": pre})
+    assert resp.status_code == 200, resp.text
+    with kb.connect() as conn:
+        assert kb.get_task(conn, task_id).assignee == "builder"
+
+
+def test_reassign_expect_preconditions_refuses_stale_board(client):
+    """Same stale-guard on the reassign endpoint: a moved board is a 409
+    before the reassign runs, not a stale apply."""
+    r = client.post("/api/plugins/kanban/tasks", json={"title": "card"})
+    task_id = r.json()["task"]["id"]
+    url = f"/api/plugins/kanban/tasks/{task_id}/reassign"
+
+    resp = client.post(url, json={"profile": "builder", "dry_run": True})
+    pre = resp.json()["probe"]["preconditions"]
+    assert pre["assignee"] is None
+
+    # Another surface assigns meanwhile; reassign_task itself would allow it.
+    assert client.patch(
+        f"/api/plugins/kanban/tasks/{task_id}", json={"assignee": "other"},
+    ).status_code == 200
+
+    resp = client.post(url, json={"profile": "builder", "expect": pre})
+    assert resp.status_code == 409, resp.text
+    with kb.connect() as conn:
+        assert kb.get_task(conn, task_id).assignee == "other"

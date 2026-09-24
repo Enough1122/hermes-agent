@@ -913,6 +913,8 @@ Neither mutates anything. Both return `{ok, dry_run: true, task_id, probe}` wher
 
 `dispatchable_after_assign` is the headline field: it is true when the assignment would put the card in front of the dispatcher immediately (ready status after the assign, target profile exists, parents satisfied). `would_refuse` mirrors the DB layer's guards (unknown task id; running claim without `reclaim_first`). Omitting `dry_run` keeps today's apply-immediately behavior — confirmation is opt-in per request.
 
+**Closing the probe→apply gap.** The probe's plan is only as fresh as its read: another surface can claim or move the card between "are you sure?" and the apply. `probe.preconditions` snapshots the row the plan was computed from (`status` / `claim_lock` / `assignee`); echo it back as `expect` on the apply request and a moved board is refused with `409` (`board moved since the dry-run probe: …`) instead of silently applying a stale plan. Omitting `expect` keeps the apply-immediately behavior.
+
 ### Operator audit trail
 
 State-changing kanban events record **who** acted, as an additive `operator` key on the event payload (issue #82689). The formats are surface-prefixed:
