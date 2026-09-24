@@ -1213,7 +1213,7 @@ def test_reassign_dry_run_probe_reports_without_mutating(client):
     assert isinstance(probe["warnings"], list)
 
     # Nothing was mutated: task still unassigned, no assigned event.
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         assert kb.get_task(conn, task_id).assignee is None
         assert [
             e for e in kb.list_events(conn, task_id) if e.kind == "assigned"
@@ -1224,7 +1224,7 @@ def test_reassign_dry_run_flags_running_claim(client):
     """A running claim without reclaim_first must surface would_refuse."""
     r = client.post("/api/plugins/kanban/tasks", json={"title": "busy"})
     task_id = r.json()["task"]["id"]
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         kb.claim_task(conn, task_id, claimer="box:1")
 
     resp = client.post(
@@ -1274,13 +1274,13 @@ def test_patch_assign_dry_run_then_apply_stamps_operator(client):
     probe = body["probe"]
     assert probe["target_profile"] == "builder"
     assert probe["task_exists"] is True
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         assert kb.get_task(conn, task_id).assignee is None
 
     # Real assign (default behavior unchanged) — event carries operator.
     resp = client.patch(url, json={"assignee": "builder"})
     assert resp.status_code == 200, resp.text
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         assert kb.get_task(conn, task_id).assignee == "builder"
         assigned = [
             e.payload for e in kb.list_events(conn, task_id)
@@ -1326,7 +1326,7 @@ def test_patch_expect_preconditions_refuses_stale_board(client):
     resp = client.patch(url, json={"assignee": "builder", "expect": pre})
     assert resp.status_code == 409, resp.text
     assert "board moved since the dry-run probe" in resp.json()["detail"]
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         assert kb.get_task(conn, task_id).assignee == "other"  # apply was refused
 
 
@@ -1342,7 +1342,7 @@ def test_patch_expect_preconditions_pass_when_board_unchanged(client):
 
     resp = client.patch(url, json={"assignee": "builder", "expect": pre})
     assert resp.status_code == 200, resp.text
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         assert kb.get_task(conn, task_id).assignee == "builder"
 
 
@@ -1364,5 +1364,5 @@ def test_reassign_expect_preconditions_refuses_stale_board(client):
 
     resp = client.post(url, json={"profile": "builder", "expect": pre})
     assert resp.status_code == 409, resp.text
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         assert kb.get_task(conn, task_id).assignee == "other"
