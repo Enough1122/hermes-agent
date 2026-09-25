@@ -1569,10 +1569,65 @@ def list_tasks(
     return [Task.from_row(r) for r in rows]
 
 
+class StalePreconditionsError(Exception):
+    """A caller-supplied ``expect`` snapshot no longer matches the task row.
+
+    Deliberately not a ``RuntimeError``/``ValueError``: ``reassign_task``
+    swallows ``RuntimeError`` to report a still-running claim, and the
+    dashboard maps ``ValueError`` to 400 — a stale-board refusal must reach
+    the caller as the 409 it is.
+    """
+
+
+def _expect_mismatch(row, expect: Optional[dict]) -> Optional[str]:
+    """Why *row* no longer matches the caller's ``expect`` snapshot, else ``None``.
+
+    ``expect`` is a dry-run probe's ``preconditions`` dict echoed back on the
+    apply request (#82689). Unknown keys are ignored rather than treated as a
+    mismatch, and a falsy ``expect`` means "no preconditions supplied" —
+    legacy callers keep their apply-immediately behaviour.
+    """
+    if not expect or row is None:
+        return None
+    observed = {
+        "status": row["status"],
+        "claim_lock": row["claim_lock"],
+        "assignee": row["assignee"],
+    }
+    for key, want in expect.items():
+        if key not in observed:
+            continue
+        have = observed[key]
+        if (want is None) != (have is None) or (want is not None and have != want):
+            return (f"{key} changed since the probe "
+                    f"(probe saw {want!r}, row now has {have!r})")
+    return None
+
+
+def _require_expected_row(conn: sqlite3.Connection, task_id: str, expect: Optional[dict]) -> None:
+    """Refuse (``StalePreconditionsError``) when the row no longer matches ``expect``.
+
+    For mutators that cannot fold the comparison into one transaction — the
+    reclaim leg of ``reassign_task`` terminates a worker before its own
+    transaction opens, so the stale-board check has to land first. The plain
+    assign path does not use this: ``assign_task`` compares inside the same
+    transaction as its update.
+    """
+    if not expect:
+        return
+    row = conn.execute(
+        "SELECT status, claim_lock, assignee FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    mismatch = _expect_mismatch(row, expect)
+    if mismatch:
+        raise StalePreconditionsError(mismatch)
+
+
 def assign_task(
     conn: sqlite3.Connection, task_id: str, profile: Optional[str],
     *,
     operator: Optional[str] = None,
+    expect: Optional[dict] = None,
 ) -> bool:
     """Assign/reassign; raises RuntimeError while the task is running under a claim.
 
@@ -1580,6 +1635,11 @@ def assign_task(
     additively on the ``assigned`` event payload (issue #82689) — e.g.
     ``cli:<user>@<host>`` or ``dashboard:<session>``. Omitting it produces
     the exact legacy payload (no new key), so old consumers are unaffected.
+
+    ``expect`` is the dry-run probe's ``preconditions`` snapshot. It is
+    compared against the row read *inside this transaction*, so a board that
+    moved between the probe and here is refused (``StalePreconditionsError``)
+    rather than silently overwritten.
     """
     profile = _canonical_assignee(profile)
     with write_txn(conn):
@@ -1588,6 +1648,9 @@ def assign_task(
         ).fetchone()
         if not row:
             return False
+        mismatch = _expect_mismatch(row, expect)
+        if mismatch:
+            raise StalePreconditionsError(mismatch)
         if row["claim_lock"] is not None and row["status"] == "running":
             raise RuntimeError(
                 f"cannot reassign {task_id}: currently running (claimed). "
@@ -2651,18 +2714,26 @@ def reassign_task(
     conn: sqlite3.Connection, task_id: str, profile: Optional[str], *, reclaim_first: bool = False,
     reason: Optional[str] = None,
     operator: Optional[str] = None,
+    expect: Optional[dict] = None,
 ) -> bool:
     """Reassign (None unassigns); a running task is refused unless
     ``reclaim_first`` releases its claim — the "this profile's model is broken" path.
 
     ``operator`` rides the ``assigned`` event payload additively (issue #82689).
+
+    ``expect`` guards the assignment (see ``assign_task``). With
+    ``reclaim_first`` it is checked against the *pre-reclaim* row before the
+    worker is terminated — the reclaim itself rewrites ``status``/
+    ``claim_lock``, so it consumes the snapshot rather than passing it on.
     """
     if reclaim_first:
+        _require_expected_row(conn, task_id, expect)
         # Safe to call even if nothing to reclaim.
         reclaim_task(conn, task_id, reason=reason or "reassign")
+        expect = None  # consumed: the reclaim is the mutation the caller confirmed
     # assign_task handles its own txn + the still-running guard.
     try:
-        return assign_task(conn, task_id, profile, operator=operator)
+        return assign_task(conn, task_id, profile, operator=operator, expect=expect)
     except RuntimeError:
         # Task is still running and reclaim_first was False; caller
         # needs to decide whether to retry with reclaim.

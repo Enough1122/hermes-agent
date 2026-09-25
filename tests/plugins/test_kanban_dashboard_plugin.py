@@ -1256,3 +1256,58 @@ def test_reassign_expect_preconditions_refuses_stale_board(client):
     assert resp.status_code == 409, resp.text
     with kbc.connect() as conn:
         assert kb.get_task(conn, task_id).assignee == "other"
+
+
+def test_assign_expect_is_checked_inside_the_write_transaction(client, monkeypatch):
+    """Invariant: the ``expect`` guard is atomic with the assignment, not a
+    pre-flight read. A competing assignment that lands after the request read
+    the row — but before the mutator's own transaction opened — must still be
+    refused with 409 (#82689 probe→apply TOCTOU).
+
+    Red before the fix: the endpoint compared ``expect`` first and only then
+    called the mutator, so a row that moved inside that window was overwritten
+    while the promise was a 409."""
+    r = client.post("/api/plugins/kanban/tasks", json={"title": "card"})
+    task_id = r.json()["task"]["id"]
+    url = f"/api/plugins/kanban/tasks/{task_id}"
+
+    resp = client.patch(url, json={"assignee": "builder", "dry_run": True})
+    pre = resp.json()["probe"]["preconditions"]
+
+    real_assign = kb.assign_task
+
+    def assign_after_competing_commit(*args, **kwargs):
+        # The competing surface writes in the window between the request's
+        # pre-flight read and the assignment's own transaction.
+        with kbc.connect() as other:
+            assert real_assign(other, task_id, "other")
+        return real_assign(*args, **kwargs)
+
+    monkeypatch.setattr(kb, "assign_task", assign_after_competing_commit)
+
+    resp = client.patch(url, json={"assignee": "builder", "expect": pre})
+    assert resp.status_code == 409, resp.text
+    assert "board moved since the dry-run probe" in resp.json()["detail"]
+    with kbc.connect() as conn:
+        assert kb.get_task(conn, task_id).assignee == "other"
+
+
+def test_reassign_reclaim_consumes_the_pre_reclaim_snapshot(client):
+    """Invariant: with ``reclaim_first`` the reclaim rewrites status/claim_lock
+    itself, so the probe's snapshot is validated against the pre-reclaim row and
+    then consumed — a confirmed reclaim must not be refused by its own
+    mutation."""
+    r = client.post("/api/plugins/kanban/tasks", json={"title": "busy"})
+    task_id = r.json()["task"]["id"]
+    with kbc.connect() as conn:
+        kb.claim_task(conn, task_id, claimer="box:1")
+
+    url = f"/api/plugins/kanban/tasks/{task_id}/reassign"
+    resp = client.post(url, json={"profile": "builder", "reclaim_first": True, "dry_run": True})
+    pre = resp.json()["probe"]["preconditions"]
+    assert pre["claim_lock"] is not None  # the snapshot describes the claimed row
+
+    resp = client.post(url, json={"profile": "builder", "reclaim_first": True, "expect": pre})
+    assert resp.status_code == 200, resp.text
+    with kbc.connect() as conn:
+        assert kb.get_task(conn, task_id).assignee == "builder"

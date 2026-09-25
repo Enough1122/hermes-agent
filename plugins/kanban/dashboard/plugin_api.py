@@ -536,8 +536,10 @@ class UpdateTaskBody(BaseModel):
     # before applying. Default false keeps today's behavior byte-for-byte.
     dry_run: bool = False
     # Stale-guard for the probe→apply round trip (#82689): echo the probe's
-    # ``preconditions`` back here and a PATCH is refused with 409 when the
-    # task row moved between "are you sure?" and the apply. Absent (default)
+    # ``preconditions`` back here and the assignment is refused with 409 when
+    # the task row moved between "are you sure?" and the apply. The comparison
+    # runs inside the assign mutator's own transaction, so a row that moves
+    # after this request is read cannot be overwritten either. Absent (default)
     # keeps today's apply-immediately behavior.
     expect: Optional[dict] = None
 
@@ -833,36 +835,22 @@ def _assign_probe(
     return probe
 
 
-def _board_moved_since_probe(conn, task_id: str, expect: Optional[dict]) -> Optional[str]:
-    """Re-check the preconditions a dry-run probe observed (#82689).
+@contextmanager
+def _assign_refusals_409() -> Iterator[None]:
+    """409s raised by the assign mutators.
 
-    ``expect`` is the probe's ``preconditions`` dict echoed back on the apply
-    request. Returns a human-readable reason when the task row no longer
-    matches (the caller turns it into a 409 before anything mutates), or
-    ``None`` when they still hold or no preconditions were supplied — absent
-    ``expect`` keeps today's apply-immediately behavior for legacy callers.
+    A still-running claim arrives as ``RuntimeError``; a stale ``expect``
+    (checked inside the mutator's own transaction) as
+    ``StalePreconditionsError`` and keeps the probe's wording so the UI can
+    tell the user to re-probe instead of retrying the same confirmation.
     """
-    if not expect:
-        return None
-    row = conn.execute(
-        "SELECT status, claim_lock, assignee FROM tasks WHERE id = ?",
-        (task_id,),
-    ).fetchone()
-    if row is None:
-        return "task no longer exists"
-    observed = {
-        "status": row["status"],
-        "claim_lock": row["claim_lock"],
-        "assignee": row["assignee"],
-    }
-    for key, want in expect.items():
-        if key not in observed:
-            continue  # unknown keys are ignored, not a mismatch
-        have = observed[key]
-        if (want is None) != (have is None) or (want is not None and have != want):
-            return (f"{key} changed since the probe "
-                    f"(probe saw {want!r}, row now has {have!r})")
-    return None
+    try:
+        yield
+    except kanban_db.StalePreconditionsError as e:
+        raise _conflict(
+            f"board moved since the dry-run probe: {e} — re-probe before assigning") from e
+    except RuntimeError as e:
+        raise _conflict(str(e)) from e
 
 
 @router.patch("/tasks/{task_id}")
@@ -891,15 +879,11 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
                 "task_id": task_id,
                 "probe": probe,
             }
-        moved = _board_moved_since_probe(conn, task_id, payload.expect)
-        if moved:
-            raise _conflict(
-                f"board moved since the dry-run probe: {moved} — re-probe before assigning")
         if payload.assignee is not None and not review_assignee_deferred:
-            with _map_errors(409, RuntimeError):
+            with _assign_refusals_409():
                 _require_ok(kanban_db.assign_task(
                     conn, task_id, payload.assignee or None,
-                    operator=_dashboard_operator()))
+                    operator=_dashboard_operator(), expect=payload.expect))
         if payload.status is not None:
             _patch_status(conn, task_id, payload, review_assignee_deferred)
         for wanted, apply, _refused in _OVERRIDE_OPS:
@@ -1244,8 +1228,10 @@ class ReassignBody(BaseModel):
     # immediately) so the UI can confirm before applying.
     dry_run: bool = False
     # Stale-guard: echo the probe's ``preconditions`` back here; a mismatch
-    # (claim taken, status/assignee changed) is refused with 409 before the
-    # reassign runs. Absent keeps today's behavior.
+    # (claim taken, status/assignee changed) is refused with 409 inside the
+    # reassign's own transaction. With ``reclaim_first`` the check lands before
+    # the worker is terminated and consumes the snapshot, since the reclaim
+    # rewrites ``status``/``claim_lock`` itself. Absent keeps today's behavior.
     expect: Optional[dict] = None
 
 
@@ -1272,13 +1258,10 @@ def reassign_task_endpoint(task_id: str, payload: ReassignBody, board: Optional[
                 "task_id": task_id,
                 "probe": probe,
             }
-        moved = _board_moved_since_probe(conn, task_id, payload.expect)
-        if moved:
-            raise _conflict(
-                f"board moved since the dry-run probe: {moved} — re-probe before assigning")
-        ok = kanban_db.reassign_task(
-            conn, task_id, payload.profile or None, reclaim_first=bool(payload.reclaim_first), reason=payload.reason,
-            operator=_dashboard_operator())
+        with _assign_refusals_409():
+            ok = kanban_db.reassign_task(
+                conn, task_id, payload.profile or None, reclaim_first=bool(payload.reclaim_first),
+                reason=payload.reason, operator=_dashboard_operator(), expect=payload.expect)
         if not ok:
             raise _conflict(
                 f"cannot reassign {task_id}: unknown id, or still "
