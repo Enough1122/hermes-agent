@@ -1809,6 +1809,7 @@ With `fail_closed: true`, each of these now **blocks** the tool call with `hook 
 | Command not found / not executable | warn, proceed | **block** |
 | Timeout | warn, proceed | **block** |
 | Non-JSON stdout (e.g. a stack trace) | warn, proceed | **block** |
+| Non-zero exit with no directive on stdout (e.g. a Python traceback, which goes to stderr and leaves stdout empty) | warn, proceed | **block** |
 | Clean exit, valid no-op JSON (`{}`) | proceed | proceed |
 
 `fail_closed` only applies to blocking-capable events (`pre_tool_call` today); setting it on any other event logs a warning at config-parse time and is ignored. `hermes hooks test` reflects these semantics — the `parsed` line shows exactly the block shape the dispatcher would receive.
