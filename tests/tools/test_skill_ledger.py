@@ -39,6 +39,7 @@ def ledger_env(tmp_path, monkeypatch):
     skills_dir.mkdir(parents=True)
 
     monkeypatch.setattr(skill_ledger, "get_hermes_home", lambda: home)
+    monkeypatch.setattr(skill_ledger, "_skills_dir", lambda: skills_dir)
     monkeypatch.setattr(skill_usage, "get_hermes_home", lambda: home)
     monkeypatch.setattr(skill_manager_tool, "SKILLS_DIR", skills_dir)
     monkeypatch.setattr(skill_utils, "get_all_skills_dirs", lambda: [skills_dir])
@@ -881,21 +882,30 @@ def test_curator_backup_fill_handles_archived_timestamped_dir(ledger_env, monkey
 
     ``_ARCHIVE_TS_SUFFIX_RE`` is ``^(.+)-\\d{14}$``, so a purge/rollback of a
     timestamped directory must still recognise the bare name underneath it.
+
+    The tar member is stored under the CATEGORIZED form (``devops/plan/...``) so
+    the assertion can only pass via the archive-stripped canonical prefix. With a
+    bare ``plan/SKILL.md`` member the bare-name candidate matches first and the
+    archive-suffix branch is never exercised, so the test would pass even if
+    ``_strip_archive_timestamp`` were deleted outright.
     """
     from tools import skill_ledger
 
-    pkg = ledger_env["skills"] / "plan-20260909120000"
+    pkg = ledger_env["skills"] / "devops" / "plan-20260909120000"
     pkg.mkdir(parents=True)
     (pkg / "SKILL.md").write_text("---\nname: plan\n---\n", encoding="utf-8")
 
+    # The reader only ever sees members that fall under a probed prefix, so the
+    # mock has to honour *prefixes* too. Returning the member unconditionally
+    # would let this test pass even with the archive-stripped prefix missing.
     monkeypatch.setattr(skill_ledger, "_read_package_files_from_latest_backup", lambda prefixes: {
-        "plan/SKILL.md": b"---\nname: plan\n---\n",
-    })
+        "devops/plan/SKILL.md": b"---\nname: plan\n---\n",
+    } if any("devops/plan/SKILL.md".startswith(p + "/") for p in prefixes) else {})
 
     out = skill_ledger.fill_snapshot_from_curator_backup(str(pkg), [])
     rels = sorted(Path(i["path"]).relative_to(ledger_env["skills"]).as_posix() for i in out)
 
-    assert rels == ["plan-20260909120000/SKILL.md"]
+    assert rels == ["devops/plan-20260909120000/SKILL.md"]
 
 
 def test_curator_backup_fill_handles_multi_level_category(ledger_env, monkeypatch):

@@ -195,12 +195,24 @@ def package_prefixes(
     root: Optional[Path] = None, skill: Optional[str] = None,
     before: Optional[List[Dict[str, str]]] = None) -> List[str]:
     """Tar member prefixes of this skill's package: live location under ``skills/``,
-    the package parent from the before-state SKILL.md path (rollback fills where
-    *root* is gone), the bare skill name, and the name minus an archive suffix."""
+    the same with an archive ``-<timestamp>`` suffix stripped, the package parent
+    from the before-state SKILL.md path (rollback fills where *root* is gone), the
+    bare skill name, and the name minus an archive suffix.
+
+    Every candidate needs its archive-stripped twin, not just ``skill``: a
+    timestamped package is restored from a backup taken while it still lived at
+    the un-suffixed path, so only ``<category>/<name>`` is stored in the tar. The
+    live form is still probed too — a backup taken after archiving stores
+    ``<category>/<name>-<ts>`` — and ``dict.fromkeys`` keeps the first occurrence,
+    so the longer live form is asked for before the shorter stripped one.
+    """
     candidates = [_package_rel(Path(root)) if root is not None else None]
     candidates += [_package_rel(p) for p in _skill_md_parents(before)]
     candidates += [skill, _strip_archive_timestamp(skill) if skill else None]
-    return list(dict.fromkeys(p for p in ((c or "").strip("/") for c in candidates) if p))
+    stripped = [
+        _strip_archive_timestamp(c) for c in list(candidates)
+        if c and _strip_archive_timestamp(c) != c]
+    return list(dict.fromkeys(p for p in ((c or "").strip("/") for c in candidates + stripped) if p))
 
 
 def _read_package_files_from_latest_backup(prefixes: List[str]) -> Dict[str, bytes]:
