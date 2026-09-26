@@ -928,6 +928,8 @@ State-changing kanban events record **who** acted, as an additive `operator` key
 
 The dashboard's session hash is a short SHA-256 prefix of the server's ephemeral session token — stable per dashboard process, never the raw token. Events written by callers predating this field (or by third-party tools calling `kanban_db` directly) simply carry no `operator` key; nothing else about the payload changed, so old consumers and old rows are unaffected. Read the trail with `hermes kanban show <id>` (events section) or `hermes kanban tail`.
 
+These strings are **audit attribution, not an authenticated identity**. A dashboard REST caller supplies whatever the handler stamps, and `cli:<user>@<host>` is derived from the process environment rather than from anything the user proved. Treat the trail as metadata that helps a human answer "which surface did this?", never as an access-control artifact or as proof of who was at the keyboard. Nothing in the dispatcher, the assign endpoints, or the reclaim path authorizes a mutation on the basis of `operator`.
+
 ### Dashboard config
 
 Any of these keys under `dashboard.kanban` in `~/.hermes/config.yaml` changes the tab's defaults — the plugin reads them at load time via `GET /config`:
