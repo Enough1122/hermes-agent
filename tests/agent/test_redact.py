@@ -556,11 +556,15 @@ class TestTelegramTokens:
 
 
 class TestInterruptDebugLogRedaction:
-    """#75461: both interrupt_debug.log write sites in cli.py route their
-    message values through redact_sensitive_text(force=True) before the
-    existing 60-char truncation. force=True is mandatory because the file
-    is persistent and must never hold a raw credential even when the user
-    has disabled global logging redaction (security.redact_secrets: false)."""
+    """#75461: both interrupt_debug.log write sites -- hermes_cli/cli_tui_mixin.py
+    (``_tui_enter_while_busy``) and hermes_cli/cli_chat_turn_mixin.py
+    (``_chat_monitor_agent_thread``); the code was split out of cli.py -- route
+    their message values through redact_sensitive_text(force=True) before the
+    existing 60-char truncation. force=True is mandatory because the file is
+    persistent and must never hold a raw credential even when the user has
+    disabled global logging redaction (security.redact_secrets: false, which
+    makes redact_sensitive_text return its input unchanged at
+    agent/redact.py:918-919)."""
 
     # Telegram bot token shape that triggered the original leak.
     TOKEN = "1234567890:" + "A" * 35
@@ -575,7 +579,7 @@ class TestInterruptDebugLogRedaction:
     def test_force_masks_even_when_redaction_disabled(self, monkeypatch):
         """Crucial: the persistent debug file must not leak a credential when
         the user has turned off global redaction. Without force=True the
-        function returns the input unchanged (agent/redact.py:687-688)."""
+        function returns the input unchanged (agent/redact.py:918-919)."""
         monkeypatch.setattr("agent.redact._REDACT_ENABLED", False)
         result = redact_sensitive_text(self.TOKEN, force=True)
         assert "A" * 35 not in result
