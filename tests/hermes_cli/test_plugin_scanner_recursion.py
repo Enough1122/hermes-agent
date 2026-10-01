@@ -277,6 +277,35 @@ class TestForeignHarnessManifestDirs:
         ]
         assert parse_warnings == []
 
+    def test_nested_unreadable_manifest_is_not_absorbed_silently(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        """The detector fails OPEN on a manifest it cannot read.
+
+        "Cannot be read" is not "known not to be v1", so an unreadable or malformed
+        nested ``plugin.json`` still goes through the parser and surfaces its
+        warning. Had the detector treated it as foreign instead, a genuinely broken
+        plugin nested in a category would vanish from discovery with nothing logged
+        — the user gets a plugin that is simply not there.
+        """
+        import os
+        hermes_home = Path(os.environ["HERMES_HOME"])  # set by hermetic conftest fixture
+        category = hermes_home / "plugins" / "image_gen"
+
+        malformed = category / "acme-broken"
+        malformed.mkdir(parents=True)
+        (malformed / "plugin.json").write_text("{not json", encoding="utf-8")
+
+        with caplog.at_level("WARNING", logger="hermes_cli.plugins"):
+            mgr = PluginManager()
+            mgr.discover_and_load()
+
+        assert not [k for k in mgr._plugins if "acme-broken" in k]
+        assert any(
+            "Failed to parse" in r.getMessage() and "acme-broken" in r.getMessage()
+            for r in caplog.records
+        ), "a malformed nested plugin.json must still warn, not be absorbed"
+
 
 # ── Kind parsing ───────────────────────────────────────────────────────────
 
