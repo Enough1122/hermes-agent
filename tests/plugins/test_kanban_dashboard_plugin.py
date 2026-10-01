@@ -1421,3 +1421,61 @@ def test_reassign_reclaim_consumes_the_pre_reclaim_snapshot(client):
     assert resp.status_code == 200, resp.text
     with kbc.connect() as conn:
         assert kb.get_task(conn, task_id).assignee == "builder"
+
+
+def test_dashboard_operator_upgrades_from_fallback_to_session_identity(monkeypatch):
+    """Invariant: only a token-derived identity is cached, never the
+    ``host:pid`` fallback (#82689 follow-up, reported by @benperry6).
+
+    ``plugin_api`` can be imported before ``web_server`` creates
+    ``_SESSION_TOKEN``, so the first operator lookup can legitimately resolve
+    the process-identity fallback. Caching that value would freeze it and
+    misattribute every later audit event to the wrong dashboard session once a
+    real token exists. The fallback must be recomputed per call until a token
+    shows up; the token-derived identity is fixed for the server's lifetime and
+    IS cached.
+    """
+    import importlib.util
+
+    repo_root = Path(__file__).resolve().parents[2]
+    plugin_file = repo_root / "plugins" / "kanban" / "dashboard" / "plugin_api.py"
+    spec = importlib.util.spec_from_file_location(
+        "hermes_dashboard_plugin_kanban_operator_test", plugin_file,
+    )
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = mod
+    spec.loader.exec_module(mod)
+
+    # Start with no token: the fallback must be returned WITHOUT being cached.
+    monkeypatch.delitem(sys.modules, "hermes_cli.web_server", raising=False)
+    assert mod._DASHBOARD_OPERATOR is None
+    fallback = mod._dashboard_operator()
+    assert fallback.startswith("dashboard:")
+    assert mod._DASHBOARD_OPERATOR is None, (
+        "the host:pid fallback must not be cached -- caching it misattributes "
+        "every later event once a real session token exists"
+    )
+
+    # A token now exists (web_server finished booting). The identity must
+    # upgrade to the token-derived session rather than keep the fallback.
+    import types
+
+    monkeypatch.setitem(
+        sys.modules, "hermes_cli.web_server",
+        types.SimpleNamespace(_SESSION_TOKEN="secret-xyz"),
+    )
+    with_token = mod._dashboard_operator()
+    assert with_token.startswith("dashboard:")
+    # A token-derived id is ``dashboard:<12 hex chars>`` -- one colon, no
+    # host:pid tail (the fallback has the form ``dashboard:<host>:<pid>``).
+    assert with_token.count(":") == 1, (
+        f"expected a hashed session id with no host:pid tail, got {with_token!r}"
+    )
+    assert with_token != fallback
+
+    # The token-derived identity is fixed for the server's lifetime, so it IS
+    # cached (and the raw token is never exposed).
+    assert mod._DASHBOARD_OPERATOR == with_token
+    assert mod._dashboard_operator() == with_token
+    assert "secret-xyz" not in with_token
