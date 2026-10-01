@@ -7,6 +7,7 @@ from agent.portal_tags import get_affinity_scope, get_conversation_context
 from agent.prompt_cache_scope import GROK_AGGREGATOR_MODEL_PREFIXES, is_fork_cache_scope
 from agent.reasoning_effort import codex_supported_efforts
 from agent.transports.codex import _cache_scope_from_session_id
+from hermes_constants import is_openrouter_preset_model
 from providers import register_provider
 from providers.base import ProviderProfile
 
@@ -62,8 +63,9 @@ OPENROUTER_ENDPOINT_PINS: dict[str, tuple[str, tuple[str, ...]]] = {
 # ``provider`` body takes precedence over that policy, so sending both lets a leftover
 # ``provider_routing`` block silently reroute a preset off the endpoint it pins — with the control
 # plane still reading back "correct" (#94589). Same shape as the Nous profile, which drops
-# caller prefs outright: the pin is the stronger, more specific intent.
-_OPENROUTER_PRESET_MARKER = "@preset/"
+# caller prefs outright: the pin is the stronger, more specific intent. The predicate itself
+# lives in hermes_constants so the profile-less legacy branch (agent/transports/chat_completions.py)
+# applies the same rule; it can reach the wire without ever loading this profile.
 
 
 class OpenRouterProfile(ProviderProfile):
@@ -140,7 +142,7 @@ class OpenRouterProfile(ProviderProfile):
         if sticky_key:
             body["session_id"] = sticky_key
         prefs = context.get("provider_preferences")
-        if _OPENROUTER_PRESET_MARKER in (context.get("model") or ""):
+        if is_openrouter_preset_model(context.get("model")):
             # The preset IS the pin; a request-level body would override it (#94589).
             prefs = None
         pin = OPENROUTER_ENDPOINT_PINS.get(context.get("model") or "")
