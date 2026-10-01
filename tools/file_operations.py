@@ -1333,15 +1333,18 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
 
     def _source_encoding_for_write(self, path: str,
                                    pre_content: Optional[str]) -> Optional[str]:
-        """The encoding a write must use for a non-UTF-8 file, else None (UTF-8).
+        """The encoding a write must use for a file that declares one, else None (UTF-8).
 
-        Set only when the caller handed over the original (``pre_content``) AND
-        that original carries bytes UTF-8 could not decode — the surrogateescape
-        range U+DC80-U+DCFF. A declared PEP 263 cookie is authoritative; without
-        one there is no way to know the encoding, so the name is only used to
-        phrase the refusal (see :meth:`_reject_foreign_encoding`).
+        A declared PEP 263 cookie is authoritative on its own: the file names its
+        encoding whatever bytes it currently holds. Keying this off the body's
+        surrogateescape bytes instead (as an earlier revision did) skipped every
+        declared file whose body happens to be pure ASCII today — the edit then
+        went out as UTF-8 into a file that says otherwise, which is the #121982
+        mixing again. Without a cookie there is no way to know the encoding, so
+        this returns None and the name is only used to phrase the refusal (see
+        :meth:`_reject_foreign_encoding`).
         """
-        if pre_content is None or not _contains_escaped_bytes(pre_content):
+        if pre_content is None:
             return None
         return declared_source_encoding(path, pre_content.encode("utf-8", "surrogateescape"))
 
@@ -1356,7 +1359,7 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
         Only consulted when the caller has the original (``pre_content``); a
         caller that hands over pre-content is mid-edit on a file it just read,
         which is the only shape that can carry the original's encoding."""
-        if pre_content is None or not _contains_escaped_bytes(pre_content):
+        if pre_content is None:
             return None
         declared = self._source_encoding_for_write(path, pre_content)
         if declared is not None:
@@ -1372,8 +1375,11 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
             return None
         # No declaration: the encoding is unknown, so only an ASCII insertion is
         # safe — in every ASCII-compatible encoding this reaches in practice
-        # (latin-1, cp1252, ...) an ASCII character is the same byte.
-        raw = pre_content.encode("utf-8", "surrogateescape")
+        # (latin-1, cp1252, ...) an ASCII character is the same byte. With no
+        # declaration AND no undecodable bytes the file is plain UTF-8 and the
+        # UTF-8 write below is already correct.
+        if not _contains_escaped_bytes(pre_content):
+            return None
         encoding = _sniff_encoding(pre_content)
         reason = encoding_refusal(path, encoding, content)
         return WriteResult(error=reason) if reason else None
@@ -1525,9 +1531,6 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
         refused = self._reject_unencodable(path, content)
         if refused is not None:
             return refused
-        refused = self._reject_foreign_encoding(path, content, pre_content)
-        if refused is not None:
-            return refused
         ext = os.path.splitext(path)[1].lower()
         refused = self._fail_closed_syntax_error(path, ext, content)
         if refused is not None:
@@ -1537,6 +1540,14 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
         # LSP coverage (keeps the hot path fast for binaries).
         want_pre = ext in LINTERS_INPROC or self._lsp_handles_extension(ext)
         has_bom, pre_content, original_ending = self._probe_write_target(path, pre_content, want_pre)
+        # AFTER the probe, so this decides on the same pre_content the source-encoding
+        # write below will read: a caller that passes none has it filled in here, and a
+        # gate run against the caller's ``None`` would skip the very file it must judge
+        # (then :meth:`_reject_foreign_encoding` returns None and
+        # :meth:`_source_encoding_for_write` — or its absence — decides alone).
+        refused = self._reject_foreign_encoding(path, content, pre_content)
+        if refused is not None:
+            return refused
         # read_file strips the BOM and models send bare-LF text, so a round-trip would
         # otherwise normalize CRLF files and drop the BOM (prepend only when absent).
         if original_ending == "\r\n":
