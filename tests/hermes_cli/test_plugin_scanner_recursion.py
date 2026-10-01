@@ -14,6 +14,7 @@ from typing import Any, Dict
 
 import hermes_yaml as yaml
 
+from hermes_cli.agent_plugins import PLUGIN_SCHEMA_V1
 from hermes_cli.plugins import PluginManager
 
 
@@ -223,6 +224,54 @@ class TestForeignHarnessManifestDirs:
 
         assert "superpowers/.hermes-plugin" in mgr._plugins
         assert not [k for k in mgr._plugins if "harness-from-the-future" in k]
+        parse_warnings = [
+            r for r in caplog.records if "Failed to parse" in r.getMessage()
+        ]
+        assert parse_warnings == []
+
+    def test_nested_v1_portable_plugin_is_not_mistaken_for_a_harness(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        """The negative arm of the schema check: a CATEGORY-NESTED ``plugin.json``
+        that DOES declare the v1 ``$schema`` is a real plugin, not a foreign-harness
+        convention, and must still be discovered.
+
+        ``image_gen/<dir>/plugin.json`` is the shape every bundled category uses
+        (key ``image_gen/<dir>``), so absorbing it would silently delete
+        category-nested Agent Plugins rather than quiet one directory's warning.
+        The sibling harness directory in the same category is the control: it is
+        skipped for the opposite reason, so the pair only passes if detection reads
+        the manifest's schema rather than the layout alone.
+        """
+        import os
+        hermes_home = Path(os.environ["HERMES_HOME"])  # set by hermetic conftest fixture
+        category = hermes_home / "plugins" / "image_gen"
+
+        real = category / "acme-portable"
+        real.mkdir(parents=True)
+        (real / "plugin.json").write_text(
+            json.dumps(
+                {
+                    "$schema": PLUGIN_SCHEMA_V1,
+                    "name": "acme.portable",
+                    "version": "1.0.0",
+                    "description": "a real nested Agent Plugin",
+                }
+            )
+        )
+
+        harness = category / "acme-harness"
+        harness.mkdir(parents=True)
+        (harness / "plugin.json").write_text(
+            json.dumps({"schemaVersion": 1, "displayName": "Acme"})
+        )
+
+        with caplog.at_level("WARNING", logger="hermes_cli.plugins"):
+            mgr = PluginManager()
+            mgr.discover_and_load()
+
+        assert "image_gen/acme-portable" in mgr._plugins
+        assert not [k for k in mgr._plugins if "acme-harness" in k]
         parse_warnings = [
             r for r in caplog.records if "Failed to parse" in r.getMessage()
         ]
